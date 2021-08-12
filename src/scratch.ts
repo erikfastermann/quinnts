@@ -1,3 +1,7 @@
+function error(): never {
+    throw new Error("internal error");
+}
+
 type Ref = {
 	kind: "ref";
 	value: string;
@@ -130,7 +134,7 @@ class Lexer implements Iterable<Token> {
 
 	unreadChar(): void {
 		if (!this.lastChar || this.lastChar.use) {
-			throw "internal error";
+			error();
 		};
 		this.lastChar.use = true;
 	};
@@ -184,18 +188,74 @@ class Lexer implements Iterable<Token> {
 		};
 
 		if (isReservedSymbol(char)) {
-			throw "impl";
+			switch (char) {
+			case '"':
+				let str = "";
+				while (true) {
+					let char = this.nextChar();
+					if (!char) {
+						throw new Error('string not closed with "')
+					};
+					if (char == '"') {
+						return {kind: "string", value: str}
+					};
+					if (char != '\r') {
+						str += char;
+					};
+				};
+			case "'":
+				let char = this.nextChar();
+				if (!char || !isIdentStart(char)) {
+					throw new Error("bare '")
+				};
+				this.unreadChar();
+				return {kind: "atom", value: this.takeWhile(isIdent)};
+			case '(':
+				return {kind: "("};
+			case ')':
+				return {kind: ")"};
+			case '{':
+				return {kind: "{"};
+			case '}':
+				return {kind: "}"};
+			case '[':
+				return {kind: "["};
+			case ']':
+				return {kind: "]"};
+			case '#':
+				while (true) {
+					let char = this.nextChar();
+					if (!char || char == '\n') {
+						return {kind: "eol"};
+					};
+				};
+			default:
+				error();
+			};
 		} else if (isIdentStart(char)) {
 			this.unreadChar();
 			return {kind: "ref", value: this.takeWhile(isIdent)};
 		} else if (isNumberStart(char)) {
-			throw "impl";
+			this.unreadChar();
+			let num = this.takeWhile(isNumber).replace("_", "");
+			if ((num.length > 1) && num[0] == '0') {
+				throw new Error(`zero padded number ${num}`)
+			};
+			return {kind: "number", value: BigInt(num)}
 		} else if (isSymbol(char)) {
-			throw "impl";
+			this.unreadChar();
+			return {kind: "symbol", value: this.takeWhile(isSymbol)}
 		} else {
 			// TODO: quote char when necessary
-			throw new Error("unknown character ${char}");
+			throw new Error(`unknown character ${char}`);
 		};
+	};
+
+	unreadToken(): void {
+		if (!this.lastToken || this.lastToken.use) {
+			error();
+		};
+		this.lastToken.use = true;
 	};
 
 	[Symbol.iterator](): Iterator<Token> {
@@ -210,7 +270,7 @@ class TokenIterator implements Iterator<Token> {
 		this.lexer = lexer;
 	};
 
-	next(): {done: boolean, value: Token} {
+	next(): IteratorResult<Token> {
 		let token = this.lexer.nextToken();
 		if (!token) {
 			// the type of Iterator requires that we always return a valid Token
@@ -221,7 +281,10 @@ class TokenIterator implements Iterator<Token> {
 	};
 };
 
-let lexer = new Lexer("hello world");
-for (let ch of lexer) {
-	console.log(ch);
+function run() {
+	let code = (document.getElementById("code") as HTMLInputElement).value;
+	let lexer = new Lexer(code);
+	for (let ch of lexer) {
+		console.log(ch);
+	};
 };

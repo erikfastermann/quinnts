@@ -2,6 +2,10 @@ function error(): never {
     throw new Error("internal error");
 };
 
+function positionError(pos: Position, message: string): Error {
+	return new Error(`${pos.path}|${pos.line} col ${pos.column}| ${message}`);
+}
+
 type Ref = {
 	kind: "ref";
 	value: string;
@@ -55,6 +59,26 @@ type EndOfLine = {
 	kind: "eol";
 };
 
+type Unit = {
+	kind: "unit";
+}
+
+type Call = {
+	kind: "call";
+	first: Expression;
+	arguments: Expression[];
+}
+
+type List = {
+	kind: "list";
+	elements: Expression[];
+}
+
+type Block = {
+	kind: "block";
+	expressions: Expression[];
+}
+
 type TokenKind =
 	| Ref
 	| Atom
@@ -69,6 +93,16 @@ type TokenKind =
 	| ClosedSquare
 	| EndOfLine;
 
+type ExpressionKind =
+	| Ref
+	| Atom
+	| QNumber
+	| QString
+	| Unit
+	| Call
+	| List
+	| Block;
+
 type Position = {
 	path: string;
 	line: number;
@@ -76,6 +110,12 @@ type Position = {
 };
 
 type Token = TokenKind & Position;
+
+type Expression = ExpressionKind & Position;
+
+function newExpression(pos: Position, expr: ExpressionKind): Expression {
+	return {...expr, path: pos.path, line: pos.line, column: pos.column};
+}
 
 // TODO: support non ascii
 
@@ -109,7 +149,6 @@ function isNumberStart(char: string): boolean {
 function isNumber(char: string): boolean {
 	return /^[0-9_]$/.test(char);
 };
-
 
 class Lexer implements Iterable<Token> {
 	path: string;
@@ -201,8 +240,16 @@ class Lexer implements Iterable<Token> {
 		if (this.lastToken && this.lastToken.use) {
 			this.lastToken.use = false;
 			return this.lastToken.token;
-		};
+		}
+		let token = this.getNextToken();
+		if (!token) {
+			return null;
+		}
+		this.lastToken = {token, use: false};
+		return token;
+	}
 
+	getNextToken(): Token | null {
 		let char = this.nextChar();
 		if (!char) {
 			if (!this.finished) {
@@ -304,6 +351,12 @@ class Lexer implements Iterable<Token> {
 		this.lastToken.use = true;
 	};
 
+	peekToken(): Token | null {
+		let token = this.nextToken();
+		this.unreadToken();
+		return token;
+	}
+
 	[Symbol.iterator](): Iterator<Token> {
 		return new TokenIterator(this);
 	};
@@ -327,10 +380,164 @@ class TokenIterator implements Iterator<Token> {
 	};
 };
 
+function collapseExpressions(pos: Position, exprs: Expression[]) {
+	switch (exprs.length) {
+		case 0:
+			return newExpression(pos, {kind: "unit"});
+		case 1:
+			return newExpression(pos, exprs[0]!);
+		default:
+			return newExpression(
+				pos,
+				{
+					kind: "call",
+					first: exprs[0]!,
+					arguments: exprs.slice(1),
+				}
+			);
+		}
+}
+
+interface PrecedenceTable { [key: string]: number; };
+
+function newPrecedenceTable(table: string[][], offset: number): PrecedenceTable {
+	let prec: PrecedenceTable = {};
+	table.forEach((level, i) => level.forEach(symbol => prec[symbol] = i + offset));
+	return prec;
+}
+
+class Parser {
+	lexer: Lexer;
+	precedenceTable: {
+		lowerThanCall: PrecedenceTable;
+		higherThanCall: PrecedenceTable;
+	};
+
+	constructor(lexer: Lexer, lowerThanCall: string[][], higherThanCall: string[][]) {
+		this.lexer = lexer;
+		this.precedenceTable = {
+			lowerThanCall: newPrecedenceTable(lowerThanCall, 0),
+			higherThanCall: newPrecedenceTable(higherThanCall, lowerThanCall.length),
+		};
+	}
+
+	mustNextToken(tk?: TokenKind): Token {
+		let token = this.lexer.nextToken();
+		if (!token || (tk && token.kind !== tk.kind)) {
+			error();
+		}
+		return token;
+	}
+
+	parse(): Expression[] {
+		let expressions = [];
+		while (true) {
+			let start = this.lexer.peekToken();
+			if (!start) {
+				return expressions;
+			}
+			let exprs = this.expressions({kind: "eol"});
+			if (exprs.length > 0) {
+				expressions.push(collapseExpressions(start, exprs));
+			}
+			this.mustNextToken();
+		}
+	}
+
+	callOrValue(): Expression {
+		let openBracket = this.mustNextToken({kind: '('});
+		let exprs = this.expressions({kind: ")"});
+		this.mustNextToken();
+		return collapseExpressions(openBracket, exprs);
+	}
+
+	list(): Expression {
+		let openSquare = this.mustNextToken({kind: "["});
+		let elements = this.expressions({kind: "]"});
+		this.mustNextToken();
+		return newExpression(openSquare, {kind: "list", elements});
+	}
+
+	block(): Expression {
+		let openCurly = this.mustNextToken({kind: "{"});
+		let expressions = [];
+		while (true) {
+			let start = this.lexer.peekToken();
+			let exprs = this.expressions({kind: "eol"}, {kind: "}"});
+			if (exprs.length > 0) {
+				expressions.push(collapseExpressions(start!, exprs));
+			}
+			if (this.lexer.nextToken()!.kind === '}') {
+				break;
+			}
+		}
+		return newExpression(openCurly, {kind: "block", expressions});
+	}
+
+	expressions(...endAt: TokenKind[]): Expression[] {
+		let exprs: Expression[] = [];
+		while (true) {
+			const token = this.lexer.nextToken();
+			if (!token) {
+				let expected = endAt.map(tk => `'${tk.kind}'`).join(", ");
+				throw new Error(`unexpected eof, expected ${expected}`);
+			} else if (endAt.some(tk => tk.kind === token.kind)) {
+				this.lexer.unreadToken();
+				return exprs;
+			} else if ([')', ']', '}'].includes(token.kind)) {
+				throw positionError(token, `unexpected ${token.kind}`)
+			} else if (["string", "number", "ref", "atom"].includes(token.kind)) {
+				exprs.push(token as Expression);
+			} else {
+				switch (token.kind) {
+				case "symbol":
+					error();
+				case "eol":
+					break;
+				case '(':
+					this.lexer.unreadToken();
+					exprs.push(this.callOrValue());
+					break;
+				case '{':
+					this.lexer.unreadToken();
+					exprs.push(this.block());
+					break;
+				case '[':
+					this.lexer.unreadToken();
+					exprs.push(this.list());
+					break;
+				default:
+					error();
+				}
+			}
+		}
+	}
+}
+
 function run() {
 	let code = (document.getElementById("code") as HTMLInputElement).value;
 	let lexer = new Lexer("textarea", code);
 	for (let char of lexer) {
 		console.log(char);
 	};
+	let parser = new Parser(
+		new Lexer("textarea", code),
+		[
+			["=", "->"],
+			["|>"],
+		],
+		[
+			["->"],
+			["&&", "||"],
+			["==", "!="],
+			["<", "<=", ">", ">="],
+			["..", "..<", "<..", "<..<"],
+			["++"],
+			["+", "-"],
+			["*", "/", "//", "%%"],
+			["@"],
+			["."],
+		],
+	);
+	console.log(parser.parse());
 };

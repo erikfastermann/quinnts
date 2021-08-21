@@ -1,5 +1,5 @@
-function error(): never {
-    throw new Error("internal error");
+function internal(): Error {
+    return new Error("internal error");
 };
 
 function positionError(pos: Position, message: string): Error {
@@ -201,7 +201,7 @@ class Lexer implements Iterable<Token> {
 
 	unreadChar(): void {
 		if (!this.lastChar || this.lastChar.use) {
-			error();
+			throw internal();
 		};
 		this.lastChar.use = true;
 		if (this.lastNewline) {
@@ -323,7 +323,7 @@ class Lexer implements Iterable<Token> {
 					};
 				};
 			default:
-				error();
+				throw internal();
 			};
 		} else if (isIdentStart(char.char)) {
 			this.unreadChar();
@@ -346,7 +346,7 @@ class Lexer implements Iterable<Token> {
 
 	unreadToken(): void {
 		if (!this.lastToken || this.lastToken.use) {
-			error();
+			throw internal();
 		};
 		this.lastToken.use = true;
 	};
@@ -354,6 +354,14 @@ class Lexer implements Iterable<Token> {
 	peekToken(): Token | null {
 		let token = this.nextToken();
 		this.unreadToken();
+		return token;
+	}
+
+	mustNextToken(tk?: TokenKind): Token {
+		let token = this.nextToken();
+		if (!token || (tk && token.kind !== tk.kind)) {
+			throw internal();
+		}
 		return token;
 	}
 
@@ -395,38 +403,31 @@ function collapseExpressions(pos: Position, exprs: Expression[]) {
 					arguments: exprs.slice(1),
 				}
 			);
-		}
+	}
 }
+
+type ValueOrSymbol = Expression | QSymbol&Position;
 
 interface PrecedenceTable { [key: string]: number; };
 
-function newPrecedenceTable(table: string[][], offset: number): PrecedenceTable {
+function newPrecedenceTable(table: string[][], factor: number): PrecedenceTable {
 	let prec: PrecedenceTable = {};
-	table.forEach((level, i) => level.forEach(symbol => prec[symbol] = i + offset));
+	table.forEach((level, i) => level.forEach(symbol => prec[symbol] = (i + 1) * factor));
 	return prec;
 }
 
 class Parser {
 	lexer: Lexer;
-	precedenceTable: {
-		lowerThanCall: PrecedenceTable;
-		higherThanCall: PrecedenceTable;
-	};
+	precedenceTable: PrecedenceTable;
 
+	// TODO: check duplicate symbols
 	constructor(lexer: Lexer, lowerThanCall: string[][], higherThanCall: string[][]) {
 		this.lexer = lexer;
 		this.precedenceTable = {
-			lowerThanCall: newPrecedenceTable(lowerThanCall, 0),
-			higherThanCall: newPrecedenceTable(higherThanCall, lowerThanCall.length),
+			...newPrecedenceTable(lowerThanCall, -1),
+			"call": 0,
+			...newPrecedenceTable(higherThanCall, 1)
 		};
-	}
-
-	mustNextToken(tk?: TokenKind): Token {
-		let token = this.lexer.nextToken();
-		if (!token || (tk && token.kind !== tk.kind)) {
-			error();
-		}
-		return token;
 	}
 
 	parse(): Expression[] {
@@ -436,90 +437,372 @@ class Parser {
 			if (!start) {
 				return expressions;
 			}
-			let exprs = this.expressions({kind: "eol"});
-			if (exprs.length > 0) {
-				expressions.push(collapseExpressions(start, exprs));
+			let valuesOrSymbols: ValueOrSymbol[] = [];
+			while(true) {
+				let next = this.lexer.nextToken();
+				if (!next) {
+					break;
+				} else if (next.kind === "eol") {
+					if (valuesOrSymbols[valuesOrSymbols.length-1]?.kind === "symbol") {
+						continue;
+					} else {
+						break;
+					}
+				} else if (next.kind === "symbol") {
+					valuesOrSymbols.push(next);
+				} else {
+					this.lexer.unreadToken();
+					valuesOrSymbols.push(this.value());
+				}
 			}
-			this.mustNextToken();
+			if (valuesOrSymbols.length > 0) {
+				expressions.push(this.collapse(start, valuesOrSymbols));
+			}
 		}
 	}
 
 	callOrValue(): Expression {
-		let openBracket = this.mustNextToken({kind: '('});
-		let exprs = this.expressions({kind: ")"});
-		this.mustNextToken();
-		return collapseExpressions(openBracket, exprs);
+		let openBracket = this.lexer.mustNextToken({kind: '('});
+		let valuesOrSymbols: ValueOrSymbol[] = [];
+		while (true) {
+			let next = this.lexer.nextToken();
+			if (!next) {
+				throw new Error("expected ')', got eof");
+			}
+			if (next.kind === "eol") {
+				continue;
+			} else if (next.kind === ")") {
+				break;
+			} else if (next.kind === "symbol") {
+				valuesOrSymbols.push(next);
+			} else {
+				this.lexer.unreadToken();
+				valuesOrSymbols.push(this.value());
+			}
+		}
+		return this.collapse(openBracket, valuesOrSymbols);
 	}
 
+	// TODO: allow symbols with higher precedence than call in lists
 	list(): Expression {
-		let openSquare = this.mustNextToken({kind: "["});
-		let elements = this.expressions({kind: "]"});
-		this.mustNextToken();
+		let openSquare = this.lexer.mustNextToken({kind: "["});
+		let elements: Expression[] = [];
+		while (true) {
+			let next = this.lexer.nextToken();
+			if (!next) {
+				throw new Error("expected ']', got eof");
+			}
+			if (next.kind === "eol") {
+				continue;
+			} else if (next.kind === "]") {
+				break;
+			} else {
+				this.lexer.unreadToken();
+				elements.push(this.value());
+			}
+		}
 		return newExpression(openSquare, {kind: "list", elements});
 	}
 
 	block(): Expression {
-		let openCurly = this.mustNextToken({kind: "{"});
+		let openCurly = this.lexer.mustNextToken({kind: "{"});
 		let expressions = [];
 		while (true) {
 			let start = this.lexer.peekToken();
-			let exprs = this.expressions({kind: "eol"}, {kind: "}"});
-			if (exprs.length > 0) {
-				expressions.push(collapseExpressions(start!, exprs));
+			let valuesOrSymbols: ValueOrSymbol[] = [];
+			while(true) {
+				let next = this.lexer.nextToken();
+				if (!next) {
+					throw new Error("expected '}', got eof");
+				} else if (next.kind === "eol") {
+					if (valuesOrSymbols[valuesOrSymbols.length-1]?.kind === "symbol") {
+						continue;
+					} else {
+						this.lexer.unreadToken();
+						break;
+					}
+				} else if (next.kind === "}") {
+					this.lexer.unreadToken();
+					break;
+				} else if (next.kind === "symbol") {
+					valuesOrSymbols.push(next);
+				} else {
+					this.lexer.unreadToken();
+					valuesOrSymbols.push(this.value());
+				}
 			}
-			if (this.lexer.nextToken()!.kind === '}') {
-				break;
+			if (valuesOrSymbols.length > 0) {
+				expressions.push(this.collapse(start!, valuesOrSymbols));
+			}
+			if (this.lexer.mustNextToken().kind === '}') {
+				return newExpression(openCurly, {kind: "block", expressions});
 			}
 		}
-		return newExpression(openCurly, {kind: "block", expressions});
 	}
 
-	expressions(...endAt: TokenKind[]): Expression[] {
-		let exprs: Expression[] = [];
-		while (true) {
-			const token = this.lexer.nextToken();
-			if (!token) {
-				let expected = endAt.map(tk => `'${tk.kind}'`).join(", ");
-				throw new Error(`unexpected eof, expected ${expected}`);
-			} else if (endAt.some(tk => tk.kind === token.kind)) {
+	value(): Expression {
+		const token = this.lexer.nextToken();
+		if (!token) {
+			throw new Error("unexpected eof");
+		} else if ([')', ']', '}', "eol"].includes(token.kind)) {
+			throw positionError(token, `unexpected ${token.kind}`)
+		} else if (["string", "number", "ref", "atom"].includes(token.kind)) {
+			return token as Expression;
+		} else {
+			switch (token.kind) {
+			case "symbol":
+				throw positionError(token, `unexpected symbol ${token.value}`);
+			case '(':
 				this.lexer.unreadToken();
-				return exprs;
-			} else if ([')', ']', '}'].includes(token.kind)) {
-				throw positionError(token, `unexpected ${token.kind}`)
-			} else if (["string", "number", "ref", "atom"].includes(token.kind)) {
-				exprs.push(token as Expression);
-			} else {
-				switch (token.kind) {
-				case "symbol":
-					error();
-				case "eol":
-					break;
-				case '(':
-					this.lexer.unreadToken();
-					exprs.push(this.callOrValue());
-					break;
-				case '{':
-					this.lexer.unreadToken();
-					exprs.push(this.block());
-					break;
-				case '[':
-					this.lexer.unreadToken();
-					exprs.push(this.list());
-					break;
-				default:
-					error();
+				return this.callOrValue();
+			case '{':
+				this.lexer.unreadToken();
+				return this.block();
+			case '[':
+				this.lexer.unreadToken();
+				return this.list();
+			default:
+				throw internal();
+			}
+		}
+	}
+
+	collapse(start: Position, valsOrSyms: ValueOrSymbol[]): Expression {
+		let parser = new OperatorParser(start, this.precedenceTable, valsOrSyms);
+		return parser.parse();
+	}
+}
+
+class OperatorParser {
+	start: Position;
+	precedenceTable: PrecedenceTable;
+	valsOrSyms: ValueOrSymbol[];
+	position = 0;
+
+	constructor(start: Position, precedenceTable: PrecedenceTable, valsOrSyms: ValueOrSymbol[]) {
+		if (valsOrSyms[0]?.kind === "symbol") {
+			let sym = valsOrSyms[0];
+			throw positionError(sym, `unexpected symbol ${sym.value}`);
+		}
+		let lastSym = false;
+		for (let valOrSym of valsOrSyms) {
+			if (valOrSym.kind === "symbol") {
+				if (lastSym) {
+					throw positionError(
+						valOrSym,
+						`symbol ${valOrSym.value} directly follows another symbol`,
+					);
 				}
+				if (!(valOrSym.value in precedenceTable)) {
+					throw positionError(
+						valOrSym,
+						`unknown operator ${valOrSym.value}`
+					)
+				}
+				lastSym = true;
+			} else {
+				lastSym = false;
+			}
+		}
+		if (valsOrSyms[valsOrSyms.length - 1]?.kind === "symbol") {
+			let sym = valsOrSyms[valsOrSyms.length - 1] as (QSymbol&Position);
+			throw positionError(sym, `unexpected symbol ${sym.value}`);
+		}
+
+		this.start = start;
+		this.precedenceTable = precedenceTable;
+		this.valsOrSyms = valsOrSyms;
+	}
+
+	precedence(sym: QSymbol): number {
+		let prec = this.precedenceTable[sym.value];
+		if (prec === undefined) {
+			throw internal();
+		}
+		return prec;
+	}
+
+	next(): ValueOrSymbol | null {
+		let position = this.position;
+		this.position++;
+		if (position >= this.valsOrSyms.length) {
+			return null;
+		} else {
+			return this.valsOrSyms[position]!;
+		}
+	}
+
+	peek(): ValueOrSymbol | null {
+		if (this.position >= this.valsOrSyms.length) {
+			return null;
+		} else {
+			return this.valsOrSyms[this.position]!;
+		}
+	}
+
+	skip(n: number): void {
+		let next = this.position + n;
+		if (n === 0 || next > this.valsOrSyms.length || next < 0) {
+			throw internal();
+		}
+		this.position = next;
+	}
+
+	parse(): Expression {
+		let exprs = [];
+		while (true) {
+			let next = this.next();
+			if (!next) {
+				return collapseExpressions(this.start, exprs);
+			} else if (next.kind === "symbol") {
+				return this.operatorLower(
+					next,
+					collapseExpressions(exprs[0] ?? this.start, exprs),
+				);
+			} else {
+				let op = this.operator(next);
+				if (!op) {
+					exprs.push(next);
+				} else {
+					exprs.push(op);
+				}
+			}
+		}
+	}
+
+	operatorLower(sym: QSymbol&Position, left: Expression): Expression {
+		const kind = "call";
+		let first = newExpression(sym, { kind: "ref", value: sym.value });
+		let right: Expression[] = [];
+		const collapseRight = (): Expression => {
+			let position = right[0];
+			if (!position) {
+				throw internal();
+			}
+			return collapseExpressions(position, right);
+		};
+
+		while (true) {
+			let next = this.next();
+			if (!next) {
+				return newExpression(left, {
+					kind,
+					first,
+					arguments: [left, collapseRight()],
+				});
+			} else if (next.kind === "symbol") {
+				if (this.precedence(next) < this.precedence(sym)) {
+					return newExpression(left, {
+						kind,
+						first,
+						arguments: [
+							left,
+							this.operatorLower(
+								next,
+								collapseRight(),
+							),
+						],
+					})
+				} else {
+					return this.operatorLower(next,
+						newExpression(left, {
+							kind,
+							first,
+							arguments: [left, collapseRight()],
+						}),
+					)
+				}
+			} else {
+				let op = this.operator(next);
+				if (!op) {
+					right.push(next);
+				} else {
+					right.push(op);
+				}
+			}
+		}
+	}
+
+	operator(left: Expression): Expression | null {
+		let sym = this.next();
+		if (!sym || sym.kind !== "symbol" || this.precedence(sym) < 0) {
+			this.skip(-1);
+			return null;
+		}
+		let right = this.next();
+		if (!right || right.kind === "symbol") {
+			throw internal();
+		}
+		const kind = "call";
+		let first = newExpression(sym, {kind: "ref", value: sym.value});
+		let current: Call = { kind, first, arguments: [left, right] };
+		let currentExpr = newExpression(left, current);
+
+		let nextSym = this.peek();
+		if (!nextSym || nextSym.kind !== "symbol") {
+			return currentExpr;
+		}
+		if (this.precedence(nextSym) > this.precedence(sym)) {
+			let next = this.operator(right);
+			if (!next) {
+				return currentExpr;
+			} else {
+				return newExpression(left, {kind, first, arguments: [left, next]});
+			}
+		} else {
+			let next = this.operator(currentExpr);
+			if (!next) {
+				return currentExpr;
+			} else {
+				return next;
 			}
 		}
 	}
 }
 
+function expressionString(expr: Expression): string {
+	switch (expr.kind) {
+	case "unit":
+		return "()";
+	case "call":
+		let first = expressionString(expr.first);
+		if (expr.arguments.length < 1) {
+			return `(${first} ())`;
+		}
+		let args = expr.arguments.map(arg => expressionString(arg)).join(" ");
+		return `(${first} ${args})`;
+	case "list":
+		let elements = expr.elements.map(arg => expressionString(arg)).join(" ");
+		return `[${elements}]`;
+	case "block":
+		let exprs = expr.expressions.map(arg => expressionString(arg)).join("\n");
+		if (expr.expressions.length < 2) {
+			return `{ ${exprs} }`;
+		}
+		return `{\n${exprs}\n}`;
+	default:
+		return expr.value.toString();
+	}
+}
+
 function run() {
 	let code = (document.getElementById("code") as HTMLInputElement).value;
-	let lexer = new Lexer("textarea", code);
-	for (let char of lexer) {
-		console.log(char);
+
+	let tokens = [];
+	for (let tok of new Lexer("textarea", code)) {
+		if (tok.kind === "atom"
+			|| tok.kind === "number"
+			|| tok.kind === "ref"
+			|| tok.kind === "string"
+			|| tok.kind === "symbol"
+		) {
+			tokens.push(`${tok.kind} (${tok.value})`)
+		} else {
+			tokens.push(`${tok.kind}`);
+		}
 	};
+	console.log(tokens.join(", "));
+
 	let parser = new Parser(
 		new Lexer("textarea", code),
 		[
@@ -539,5 +822,8 @@ function run() {
 			["."],
 		],
 	);
-	console.log(parser.parse());
+	let exprs = parser.parse();
+	for (let expr of exprs) {
+		console.log(expressionString(expr));
+	}
 };

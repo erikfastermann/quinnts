@@ -63,9 +63,11 @@ type Unit = {
 	kind: "unit";
 }
 
+type Callable = (Ref | Block | Call) & Position;
+
 type Call = {
 	kind: "call";
-	first: Expression;
+	first: Callable;
 	arguments: Expression[];
 }
 
@@ -388,18 +390,25 @@ class TokenIterator implements Iterator<Token> {
 	};
 };
 
-function collapseExpressions(pos: Position, exprs: Expression[]) {
+function collapseExpressions(pos: Position, exprs: Expression[]): Expression {
 	switch (exprs.length) {
 		case 0:
 			return newExpression(pos, {kind: "unit"});
 		case 1:
 			return newExpression(pos, exprs[0]!);
 		default:
+			let first = exprs[0]!;
+			if (first.kind !== "ref"
+				&& first.kind !== "block"
+				&& first.kind !== "call"
+			) {
+				throw positionError(first, "can only call ident, block or call");
+			}
 			return newExpression(
 				pos,
 				{
 					kind: "call",
-					first: exprs[0]!,
+					first,
 					arguments: exprs.slice(1),
 				}
 			);
@@ -672,7 +681,10 @@ class OperatorParser {
 
 	operatorLower(sym: QSymbol&Position, left: Expression): Expression {
 		const kind = "call";
-		let first = newExpression(sym, { kind: "ref", value: sym.value });
+		let first = newExpression(
+			sym,
+			{ kind: "ref", value: sym.value },
+		) as Ref&Position;
 		let right: Expression[] = [];
 		const collapseRight = (): Expression => {
 			let position = right[0];
@@ -734,7 +746,10 @@ class OperatorParser {
 			throw internal();
 		}
 		const kind = "call";
-		let first = newExpression(sym, {kind: "ref", value: sym.value});
+		let first = newExpression(
+			sym,
+			{kind: "ref", value: sym.value},
+		) as Ref&Position;
 		let current: Call = { kind, first, arguments: [left, right] };
 		let currentExpr = newExpression(left, current);
 
@@ -785,6 +800,424 @@ function expressionString(expr: Expression): string {
 	}
 }
 
+class Namespace<T> implements Iterable<[string, T]>{
+	key: string;
+	value: T;
+	left: Namespace<T> | null = null;
+	right: Namespace<T> | null = null;
+
+	constructor(
+		key: string,
+		value: T,
+		left: Namespace<T> | null,
+		right: Namespace<T> | null
+	) {
+		this.key = key;
+		this.value = value;
+		this.left = left;
+		this.right = right;
+	}
+
+	toString(): string {
+		let str = "";
+		if (this.left) {
+			str += this.left.toString() + ", ";
+		}
+		str += `${this.key}: ${this.value}`;
+		if (this.right) {
+			str += ", " + this.right.toString();
+		}
+		return str;
+	}
+
+	get(key: string): T | undefined {
+		try {
+			return this.mustGet(key);
+		} catch {
+			return undefined;
+		}
+	}
+
+	mustGet(key: string): T {
+		let current: Namespace<T> = this;
+		while (true) {
+			if (key < current.key) {
+				if (!current.left) {
+					throw new Error(`key ${key} not found`);
+				}
+				current = current.left;
+			} else if (key > current.key) {
+				if (!current.right) {
+					throw new Error(`key ${key} not found`);
+				}
+				current = current.right;
+			} else {
+				return current.value;
+			}
+		}
+	}
+
+	insert(key: string, value: T): Namespace<T> | undefined {
+		try {
+			return this.mustInsert(key, value);
+		} catch {
+			return undefined;
+		}
+	}
+
+	mustInsert(key: string, value: T): Namespace<T> {
+		if (key < this.key) {
+			if (!this.left) {
+				return new Namespace(
+					this.key,
+					this.value,
+					new Namespace(key, value, null, null),
+					this.right,
+				);
+			}
+			return new Namespace(
+				this.key,
+				this.value,
+				this.left.mustInsert(key, value),
+				this.right,
+			);
+		} else if (key > this.key) {
+			if (!this.right) {
+				return new Namespace(
+					this.key,
+					this.value,
+					this.left,
+					new Namespace(key, value, null, null),
+				);
+			}
+			return new Namespace(
+				this.key,
+				this.value,
+				this.left,
+				this.right.mustInsert(key, value),
+			);
+		} else {
+			throw new Error(`duplicate key ${key}`)
+		}
+	}
+
+	mustInsertMany(other: Namespace<T>): Namespace<T> {
+		let current: Namespace<T> = this;
+		for (let [key, value] of other) {
+			current = current.mustInsert(key, value);
+		}
+		return current;
+	}
+
+	*[Symbol.iterator](): Iterator<[string, T]> {
+		if (this.left) {
+			yield* this.left;
+		}
+		yield [this.key, this.value];
+		if (this.right) {
+			yield* this.right;
+		}
+	}
+}
+
+class EmptyNamespace<T> implements Iterable<[string, T]> {
+	// dummy values to make the typechecker happy
+	key: string = undefined as any as string;
+	value: T = undefined as any as T;
+	left: Namespace<T> | null = undefined as any as null;
+	right: Namespace<T> | null = undefined as any as null;
+
+	toString(): string { return ""; }
+	get(_key: string): T | undefined { return undefined; }
+	mustGet(key: string): T { throw `key ${key} not found`; }
+	insert(key: string, value: T): Namespace<T> | undefined {
+		return new Namespace(key, value, null, null);
+	}
+	mustInsert(key: string, value: T): Namespace<T> {
+		return new Namespace(key, value, null, null);
+	}
+	mustInsertMany(other: Namespace<T>): Namespace<T> {
+		let current: Namespace<T> = this;
+		for (let [key, value] of other) {
+			current = current.mustInsert(key, value);
+		}
+		return current;
+	}
+	*[Symbol.iterator](): Iterator<[string, T]> {}
+}
+
+const ourNamespace = "ourNamespace";
+
+const theirNamespace = "theirNamespace";
+
+const unpackAndMaybeAddToOurs = "unpackAndMaybeAddToOurs";
+
+const unpackAndMaybeAddToOursFn = `const ${unpackAndMaybeAddToOurs} = ([insertable, ret]) => {
+	if (insertable) {
+		${ourNamespace} = ${ourNamespace}.mustInsertMany(insertable);
+	}
+	return ret;
+};`
+
+const newAtom = "newAtom";
+
+const newList = "newList";
+
+const newListFromArgs = "newListFromArgs";
+
+const newBlock = "newBlock";
+
+function stringMap(str: string, predicate: (char: string) => string): string {
+	let out = "";
+	for (let char of str) {
+		out += predicate(char);
+	}
+	return out;
+}
+
+function toJavascriptString(str: string): string {
+	let esc = stringMap(str, char => {
+		if (char === "\\") {
+			return "\\\\";
+		} else if (char === '"') {
+			return '\\"';
+		} else {
+			return char;
+		}
+	});
+	return `"${esc}"`;
+}
+
+class Compiler {
+	varNames: Namespace<string>;
+	body: Expression[];
+	temporariesIndex: number;
+	code = "";
+
+	constructor(varNames: Namespace<string>, body: Expression[], temporariesOffset = 0) {
+		this.varNames = varNames;
+		this.body = body;
+		this.temporariesIndex = temporariesOffset;
+	}
+
+	compile(): string {
+		if (this.body.length === 0) {
+			this.code = "return [null, null];"
+		}
+		if (this.code !== "") {
+			return this.code;
+		}
+
+		for (let i = 0; i < this.body.length-1; i++) {
+			let expr = this.body[i]!;
+			if (expr.kind !== "call") {
+				continue;
+			}
+			this.code += this.expr(expr) + ";";
+		}
+		let last = this.expr(this.body[this.body.length-1]!);
+		this.code += `return [null, ${last}];`
+		return this.code;
+	}
+
+	expr(expr: Expression): string {
+		switch (expr.kind) {
+		case "unit":
+			return "null";
+		case "number":
+			return `${expr.value}n`;
+		case "string":
+			return `${toJavascriptString(expr.value)}`
+		case "atom":
+			return `(${newAtom}(${toJavascriptString(expr.value)}))`;
+		case "ref":
+			return this.varNames.get(expr.value)
+				?? `(${ourNamespace}.mustGet(${toJavascriptString(expr.value)}))`;
+		case "call":
+			let first = this.expr(expr.first);
+			let args = expr.arguments.map(arg => this.expr(arg)).join(", ");
+			return `(${unpackAndMaybeAddToOurs}(${first}(${ourNamespace}, ${args})))`;
+		case "list":
+			let elements = expr.elements.map(e => this.expr(e)).join(", ");
+			return `(${newList}(${elements}))`;
+		case "block":
+			let content = new Compiler(this.varNames, expr.expressions).compile();
+			// TODO: check arg length === 1 for basic block
+			return `(${newBlock}(${ourNamespace}, function(${theirNamespace}, ..._) {\n`
+				+ `let ${ourNamespace} = this;\n`
+				+ unpackAndMaybeAddToOursFn + '\n\n'
+				+ content + "\n}))";
+		}
+	}
+}
+
+// TODO: persistent array
+class RuntimeList {
+	elements: RuntimeType[];
+
+	constructor(...elements: RuntimeType[]) {
+		this.elements = elements;
+	}
+
+	toString(): string {
+		return "[" + this.elements.map(e => runtimeTypeString(e)).join(" ") + "]";
+	}
+}
+
+type RuntimeType = null | bigint | string | Atom | RuntimeList | RuntimeBlock;
+
+type RuntimeBlock = (ns: Namespace<RuntimeType>, ...args: (RuntimeType | undefined)[])
+	=> [Namespace<RuntimeType> | null, RuntimeType];
+
+function runtimeTypeString(v: RuntimeType): string {
+	if (v === null) {
+		return "()";
+	} else if (typeof v === "function") {
+		return "block";
+	} else if (typeof v === "object" && 'kind' in v && v.kind === "atom") {
+		return `(atom ${toJavascriptString(v.value)})`;
+	} else {
+		return v.toString();
+	}
+}
+
+function println(s: string) {
+	console.log(s);
+}
+
+function checkArgumentLength(expected: number, got: { length: number}): void {
+	if (expected !== got.length-1) {
+		throw new Error(`expected ${expected} arguments, got ${got.length-1}`);
+	}
+}
+
+// TODO: better error handling
+function argumentError(): Error {
+	return new Error("bad argument type(s)");
+}
+
+const builtinBlocks: [string, RuntimeBlock][] = [
+	["+", function(_, x, y) {
+		checkArgumentLength(2, arguments);
+		if (typeof x !== "bigint" || typeof y !== "bigint") {
+			throw argumentError();
+		}
+		return [null, x+y];
+	}],
+	["println", function(_, ...args) {
+		println(args.map(v => runtimeTypeString(v!)).join(" "));
+		return [null, null];
+	}],
+];
+
+const builtinNamespace = builtinBlocks.reduce(
+	(ns: Namespace<RuntimeType>, [str, block]) => {
+		return ns.mustInsert(str, block);
+	},
+	new EmptyNamespace<RuntimeType>(),
+);
+
+const internals: { [name: string]: Function } = {
+	[newAtom]: (value: string): Atom => {
+		return {kind: "atom", value};
+	},
+	[newList]: (...elements: RuntimeType[]): RuntimeList => {
+		return new RuntimeList(...elements);
+	},
+	[newBlock]: (ns: Namespace<RuntimeType>, block: RuntimeBlock): RuntimeBlock => {
+		return block.bind(ns);
+	},
+};
+
+function stringAll(str: string, predicate: (char: string) => boolean): boolean {
+	for (let char of str) {
+		if (!predicate(char)) {
+			return false;
+		}
+	}
+	return true;
+}
+
+function mustStringFirst(str: string): string {
+	for (let char of str) {
+		return char;
+	}
+	throw new Error("empty string");
+}
+
+const escapedSymbols: { [key: string]: string } = {
+	"!": "ExclamationMark",
+	"$": "Dollar",
+	"%": "Percent",
+	"&": "Ampersand",
+	"*": "Asterisk",
+	"+": "Plus",
+	",": "Comma",
+	"-": "Minus",
+	".": "Period",
+	"/": "Slash",
+	":": "Colon",
+	";": "Semicolon",
+	"<": "LessThan",
+	"=": "EqualitySign",
+	">": "GreaterThan",
+	"?": "QuestionMark",
+	"@": "AtSign",
+	"\\": "Backslash",
+	"^": "Caret",
+	"`": "Accent",
+	"|": "VerticalBar",
+	"~": "Tilde",
+};
+
+function toJavascriptVarName(str: string): string {
+	if (str.length === 0) {
+		throw internal();
+	}
+
+	if (isIdentStart(mustStringFirst(str)) && stringAll(str, isIdent)) {
+		// TODO: check still valid with non ascii idents
+		return `ident_${str}`;
+	} else if (stringAll(str, isSymbol)) {
+		let escaped = stringMap(str, char => {
+			let esc = escapedSymbols[char];
+			if (esc === undefined) {
+				return `U${char.codePointAt(0)}`;
+			}
+			return esc;
+		})
+		return `symbol_${escaped}`;
+	} else {
+		throw internal();
+	}
+}
+
+const builtinNamespaceVarNames = (() => {
+	let ns: Namespace<string> = new EmptyNamespace<string>();
+	for (let [name, _] of builtinNamespace) {
+		ns = ns.mustInsert(name, toJavascriptVarName(name));
+	};
+	return ns;
+})();
+
+function runExpressions(exprs: Expression[]): void {
+	let code = "'use strict';\n\n";
+	const internalsName = "internals";
+	for (let name in internals) {
+		code += `const ${name} = ${internalsName}.${name};\n`;
+	}
+	code += "\n";
+
+	for (let [name, varName] of builtinNamespaceVarNames) {
+		code += `const ${varName} = ${ourNamespace}.mustGet(${toJavascriptString(name)});\n`;
+	}
+	code += `\n${unpackAndMaybeAddToOursFn}\n\n`;
+
+	code += new Compiler(builtinNamespaceVarNames, exprs).compile();
+	console.log(code);
+	new Function(internalsName, ourNamespace, code)(internals, builtinNamespace);
+}
+
 function run() {
 	let code = (document.getElementById("code") as HTMLInputElement).value;
 
@@ -826,4 +1259,6 @@ function run() {
 	for (let expr of exprs) {
 		console.log(expressionString(expr));
 	}
+
+	runExpressions(exprs);
 };

@@ -1065,7 +1065,19 @@ class RuntimeList {
 	}
 }
 
-type RuntimeType = null | bigint | string | Atom | RuntimeList | RuntimeBlock;
+class RuntimeAtom {
+	value: string;
+
+	constructor(value: string) {
+		this.value = value;
+	}
+
+	toString(): string {
+		return `(atom ${toJavascriptString(this.value)})`;
+	}
+}
+
+type RuntimeType = null | bigint | string | RuntimeBlock | RuntimeAtom | RuntimeList;
 
 type RuntimeBlock = (ns: Namespace<RuntimeType>, ...args: (RuntimeType | undefined)[])
 	=> [Namespace<RuntimeType> | null, RuntimeType];
@@ -1075,8 +1087,6 @@ function runtimeTypeString(v: RuntimeType): string {
 		return "()";
 	} else if (typeof v === "function") {
 		return "block";
-	} else if (typeof v === "object" && 'kind' in v && v.kind === "atom") {
-		return `(atom ${toJavascriptString(v.value)})`;
 	} else {
 		return v.toString();
 	}
@@ -1086,7 +1096,7 @@ function println(s: string) {
 	console.log(s);
 }
 
-function checkArgumentLength(expected: number, got: { length: number}): void {
+function checkArgumentLength(expected: number, got: { length: number }): void {
 	if (expected !== got.length-1) {
 		throw new Error(`expected ${expected} arguments, got ${got.length-1}`);
 	}
@@ -1119,8 +1129,8 @@ const builtinNamespace = builtinBlocks.reduce(
 );
 
 const internals: { [name: string]: Function } = {
-	[newAtom]: (value: string): Atom => {
-		return {kind: "atom", value};
+	[newAtom]: (value: string): RuntimeAtom => {
+		return new RuntimeAtom(value);
 	},
 	[newList]: (...elements: RuntimeType[]): RuntimeList => {
 		return new RuntimeList(...elements);

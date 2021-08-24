@@ -419,12 +419,6 @@ type ValueOrSymbol = Expression | QSymbol&Position;
 
 interface PrecedenceTable { [key: string]: number; };
 
-function newPrecedenceTable(table: string[][], factor: number): PrecedenceTable {
-	let prec: PrecedenceTable = {};
-	table.forEach((level, i) => level.forEach(symbol => prec[symbol] = (i + 1) * factor));
-	return prec;
-}
-
 class Parser {
 	lexer: Lexer;
 	precedenceTable: PrecedenceTable;
@@ -432,11 +426,18 @@ class Parser {
 	// TODO: check duplicate symbols
 	constructor(lexer: Lexer, lowerThanCall: string[][], higherThanCall: string[][]) {
 		this.lexer = lexer;
-		this.precedenceTable = {
-			...newPrecedenceTable(lowerThanCall, -1),
-			"call": 0,
-			...newPrecedenceTable(higherThanCall, 1)
+		this.precedenceTable = {};
+		let insertPrecedence = (table: string[][], factor: number) => {
+			table.forEach((level, i) => level.forEach(symbol => {
+				if (!stringAll(symbol, isSymbol) || this.precedenceTable.hasOwnProperty(symbol)) {
+					throw internal();
+				}
+				this.precedenceTable[symbol] = (i + 1) * factor;
+			}));
 		};
+		insertPrecedence(lowerThanCall, -1),
+		this.precedenceTable["call"] = 0;
+		insertPrecedence(higherThanCall, 1)
 	}
 
 	parse(): Expression[] {
@@ -602,7 +603,7 @@ class OperatorParser {
 						`symbol ${valOrSym.value} directly follows another symbol`,
 					);
 				}
-				if (!(valOrSym.value in precedenceTable)) {
+				if (!precedenceTable.hasOwnProperty(valOrSym.value)) {
 					throw positionError(
 						valOrSym,
 						`unknown operator ${valOrSym.value}`
@@ -1203,7 +1204,7 @@ const builtinNamespaceVarNames = (() => {
 function runExpressions(exprs: Expression[]): void {
 	let code = "'use strict';\n\n";
 	const internalsName = "internals";
-	for (let name in internals) {
+	for (let name of Object.keys(internals)) {
 		code += `const ${name} = ${internalsName}.${name};\n`;
 	}
 	code += "\n";
@@ -1239,7 +1240,7 @@ function run() {
 	let parser = new Parser(
 		new Lexer("textarea", code),
 		[
-			["=", "->"],
+			["=", "<-"],
 			["|>"],
 		],
 		[

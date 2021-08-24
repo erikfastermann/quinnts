@@ -902,14 +902,6 @@ class Namespace<T> implements Iterable<[string, T]>{
 		}
 	}
 
-	mustInsertMany(other: Namespace<T>): Namespace<T> {
-		let current: Namespace<T> = this;
-		for (let [key, value] of other) {
-			current = current.mustInsert(key, value);
-		}
-		return current;
-	}
-
 	*[Symbol.iterator](): Iterator<[string, T]> {
 		if (this.left) {
 			yield* this.left;
@@ -937,13 +929,6 @@ class EmptyNamespace<T> implements Iterable<[string, T]> {
 	mustInsert(key: string, value: T): Namespace<T> {
 		return new Namespace(key, value, null, null);
 	}
-	mustInsertMany(other: Namespace<T>): Namespace<T> {
-		let current: Namespace<T> = this;
-		for (let [key, value] of other) {
-			current = current.mustInsert(key, value);
-		}
-		return current;
-	}
 	*[Symbol.iterator](): Iterator<[string, T]> {}
 }
 
@@ -951,11 +936,13 @@ const ourNamespace = "ourNamespace";
 
 const theirNamespace = "theirNamespace";
 
+const namespaceInsertMap = "namespaceInsertMap";
+
 const unpackAndMaybeAddToOurs = "unpackAndMaybeAddToOurs";
 
-const unpackAndMaybeAddToOursFn = `const ${unpackAndMaybeAddToOurs} = ([insertable, ret]) => {
+const unpackAndMaybeAddToOursDefinition = `const ${unpackAndMaybeAddToOurs} = ([insertable, ret]) => {
 	if (insertable) {
-		${ourNamespace} = ${ourNamespace}.mustInsertMany(insertable);
+		${ourNamespace} = ${namespaceInsertMap}(${ourNamespace}, insertable);
 	}
 	return ret;
 };`
@@ -1043,25 +1030,50 @@ class Compiler {
 			return `(${newList}(${elements}))`;
 		case "block":
 			let content = new Compiler(this.varNames, expr.expressions).compile();
-			// TODO: check arg length === 1 for basic block
-			return `(${newBlock}(${ourNamespace}, function(${theirNamespace}, ..._) {\n`
+			return `(${newBlock}(${ourNamespace}, function(${theirNamespace}, ...args) {\n`
+				+ "if (!(args.length === 0 || (args.length === 1 && args[0] === null))) {\n"
+				+ "\tthrow new Error('cannot call basic block with arguments');\n"
+				+ "}\n"
 				+ `let ${ourNamespace} = this;\n`
-				+ unpackAndMaybeAddToOursFn + '\n\n'
+				+ unpackAndMaybeAddToOursDefinition + '\n\n'
 				+ content + "\n}))";
 		}
 	}
 }
 
-// TODO: persistent array
-class RuntimeList {
-	elements: RuntimeType[];
+type RuntimeValue = null | boolean | bigint | string | RuntimeBlock | RuntimeAtom | RuntimeList | RuntimeMap;
 
-	constructor(...elements: RuntimeType[]) {
-		this.elements = elements;
+type RuntimeBlock = {
+	namespace: Namespace<RuntimeValue>;
+	original: RuntimeBlockFunction;
+	(ns: Namespace<RuntimeValue>, ...args: (RuntimeValue | undefined)[]):
+		ReturnType<RuntimeBlockFunction>;
+};
+
+type RuntimeBlockFunction = (ns: Namespace<RuntimeValue>, ...args: (RuntimeValue | undefined)[])
+	=> [RuntimeMap | null, RuntimeValue];
+
+function runtimeValueString(v: RuntimeValue): string {
+	if (v === null) {
+		return "()";
+	} else if (typeof v === "function") {
+		return "block";
+	} else {
+		return v.toString();
 	}
+}
 
-	toString(): string {
-		return "[" + this.elements.map(e => runtimeTypeString(e)).join(" ") + "]";
+function valueEquals(v1: RuntimeValue, v2: RuntimeValue): boolean {
+	if (v1 === null
+		|| typeof v1 === "boolean"
+		|| typeof v1 === "bigint"
+		|| typeof v1 === "string"
+	) {
+		return v1 === v2;
+	} else if (typeof v1 === "function") {
+		return false;
+	} else {
+		return v1.equals(v2);
 	}
 }
 
@@ -1072,23 +1084,234 @@ class RuntimeAtom {
 		this.value = value;
 	}
 
+	equals(other: RuntimeValue): boolean {
+		if (!(other instanceof RuntimeAtom)) {
+			return false;
+		}
+		return this.value === other.value;
+	}
+
 	toString(): string {
 		return `(atom ${toJavascriptString(this.value)})`;
 	}
 }
 
-type RuntimeType = null | bigint | string | RuntimeBlock | RuntimeAtom | RuntimeList;
+// TODO: efficient list
+class RuntimeList implements Iterable<RuntimeValue> {
+	elements: RuntimeValue[];
 
-type RuntimeBlock = (ns: Namespace<RuntimeType>, ...args: (RuntimeType | undefined)[])
-	=> [Namespace<RuntimeType> | null, RuntimeType];
+	constructor(...elements: RuntimeValue[]) {
+		this.elements = elements;
+	}
 
-function runtimeTypeString(v: RuntimeType): string {
-	if (v === null) {
-		return "()";
-	} else if (typeof v === "function") {
-		return "block";
+	equals(other: RuntimeValue): boolean {
+		if (!(other instanceof RuntimeList)) {
+			return false;
+		}
+		if (this.elements.length !== other.elements.length) {
+			return false;
+		};
+		for (let i = 0; i < this.elements.length; i++) {
+			if (!valueEquals(this.elements[i]!, other.elements[i]!)) {
+				return false;
+			}
+		}
+		return true;
+	}
+
+	len(): bigint {
+		return BigInt(this.elements.length);
+	}
+
+	at(idx: bigint): RuntimeValue {
+		if (idx < 0 || idx >= this.elements.length) {
+			throw new Error(`
+				list out of bounds (${idx} with length ${this.elements.length})`,
+			);
+		}
+		return this.elements[Number(idx)]!;
+	}
+
+	toString(): string {
+		return "[" + this.elements.map(e => runtimeValueString(e)).join(" ") + "]";
+	}
+
+	*[Symbol.iterator]() {
+		yield* this.elements;
+	}
+}
+
+// TODO: efficient map
+class RuntimeMap implements Iterable<RuntimeList> {
+	elements: { key: RuntimeValue, value: RuntimeValue }[];
+	
+	constructor(elements: { key: RuntimeValue, value: RuntimeValue }[]) {
+		this.elements = elements;
+	}
+
+	static fromRuntimeValues(ns: Namespace<RuntimeValue>, ...values: RuntimeValue[]): RuntimeMap {
+		let elements = [];
+		for (let v of values) {
+			let key;
+			let value;
+			if (v instanceof RuntimeAtom) {
+				key = v;
+				value = ns.mustGet(v.value);
+			} else if (v instanceof RuntimeList && v.len() == 2n) {
+				key = v.at(0n);
+				value = v.at(1n);
+			} else {
+				throw new Error(
+					"can only create map from list of atoms or pairs of key and value",
+				);
+			}
+
+			for (let { key: existingKey } of elements) {
+				if (valueEquals(key, existingKey)) {
+					throw new Error(`duplicate key ${runtimeValueString(key)} while creating map`);
+				}
+			}
+			elements.push({ key, value });
+		}
+		return new RuntimeMap(elements);
+	}
+
+	tryGet(key: RuntimeValue): RuntimeValue | undefined {
+		try {
+			return this.get(key);
+		} catch {
+			return undefined;
+		}
+	}
+
+	get(key: RuntimeValue): RuntimeValue {
+		for (let { key: ourKey, value } of this.elements) {
+			if (valueEquals(key, ourKey)) {
+				return value;
+			}
+		}
+		throw new Error(`map: failed getting value for key ${runtimeValueString(key)}`);
+	}
+
+	insert(key: RuntimeValue, value: RuntimeValue): RuntimeMap {
+		for (let { key: ourKey } of this.elements) {
+			if (valueEquals(key, ourKey)) {
+				throw new Error(`map insert failed, duplicate key ${runtimeValueString(key)}`);
+			}
+		}
+		let next = this.elements.slice();
+		next.push({ key, value });
+		return new RuntimeMap(next);
+	}
+
+	insertMany(other: RuntimeMap): RuntimeMap {
+		for (let { key } of other.elements) {
+			for (let { key: ourKey } of this.elements) {
+				if (valueEquals(key, ourKey)) {
+					throw new Error(`map insertMany failed, duplicate key ${runtimeValueString(key)}`);
+				}
+			}
+		}
+		let next = this.elements.slice();
+		for (let { key, value } of other.elements) {
+			next.push({ key, value });
+		}
+		return new RuntimeMap(next);
+	}
+
+	equals(other: RuntimeValue): boolean {
+		if (!(other instanceof RuntimeMap)) {
+			return false;
+		}
+		if (this.elements.length !== other.elements.length) {
+			return false;
+		}
+		for (let { key, value } of this.elements) {
+			let found = false;
+			for (let { key: otherKey, value: otherValue } of other.elements) {
+				if (valueEquals(key, otherKey)) {
+					if (valueEquals(value, otherValue)) {
+						found = true;
+						break
+					} else {
+						return false;
+					}
+				}
+			}
+			if (!found) {
+				return false;
+			}
+		}
+		return true;
+	}
+
+	toString(): string {
+		let str = "map";
+		for (let { key, value } of this.elements) {
+			str += ` [(${runtimeValueString(key)}) (${runtimeValueString(value)})]`;
+		}
+		return str;
+	}
+
+	*[Symbol.iterator]() {
+		for (let { key, value } of this.elements) {
+			yield new RuntimeList(key, value);
+		}
+	}
+}
+
+function match(matcher: RuntimeValue, value: RuntimeValue): boolean | RuntimeMap {
+	if (matcher === null
+		|| typeof matcher === "boolean"
+		|| typeof matcher === "bigint"
+		|| typeof matcher === "string"
+	) {
+		return matcher === value;
+	} else if (matcher instanceof RuntimeAtom) {
+		return RuntimeMap.fromRuntimeValues(new EmptyNamespace<RuntimeValue>(), new RuntimeList(matcher, value));
+	} else if (typeof matcher === "function") {
+		let result = matcher(new EmptyNamespace<RuntimeValue>(), value)[1];
+		if (typeof result === "boolean" || result instanceof RuntimeMap) {
+			return result;
+		} else {
+			throw new Error("matcher block must return boolean or map");
+		}
+	} else if (matcher instanceof RuntimeList) {
+		if (!(value instanceof RuntimeList) || matcher.len() != value.len()) {
+			return false;
+		}
+		let results = RuntimeMap.fromRuntimeValues(new EmptyNamespace<RuntimeValue>());
+		for (let i = 0n; i < matcher.len(); i++) {
+			let result = match(matcher.at(i), value.at(i));
+			if (!result) {
+				return false;
+			}
+			if (result instanceof RuntimeMap) {
+				results = results.insertMany(result);
+			}
+		}
+		return results;
+	} else if (matcher instanceof RuntimeMap) {
+		if (!(value instanceof RuntimeMap)) {
+			return false;
+		}
+		let results = RuntimeMap.fromRuntimeValues(new EmptyNamespace<RuntimeValue>());
+		for (let kv of matcher) {
+			let found = value.tryGet(kv.at(0n));
+			if (found === undefined) {
+				return false;
+			}
+			let result = match(kv.at(1n), found);
+			if (!result) {
+				return false;
+			}
+			if (result instanceof RuntimeMap) {
+				results = results.insertMany(result);
+			}
+		}
+		return results;
 	} else {
-		return v.toString();
+		throw internal();
 	}
 }
 
@@ -1107,7 +1330,19 @@ function argumentError(): Error {
 	return new Error("bad argument type(s)");
 }
 
-const builtinBlocks: [string, RuntimeBlock][] = [
+const builtinBlocks: [string, RuntimeBlockFunction][] = [
+	["=", function(_, assignee, value) {
+		checkArgumentLength(2, arguments);
+		let result = match(assignee!, value!);
+		if (!result) {
+			throw new Error("= pattern match failed");
+		}
+		if (result instanceof RuntimeMap) {
+			return [result, null];
+		} else {
+			return [null, null];
+		}
+	}],
 	["+", function(_, x, y) {
 		checkArgumentLength(2, arguments);
 		if (typeof x !== "bigint" || typeof y !== "bigint") {
@@ -1115,29 +1350,75 @@ const builtinBlocks: [string, RuntimeBlock][] = [
 		}
 		return [null, x+y];
 	}],
+	["map", function(ns, ...elements) {
+		return [null, RuntimeMap.fromRuntimeValues(ns, ...elements as RuntimeValue[])];
+	}],
+	["insertCall", function(ns, block, atomsAndValues) {
+		checkArgumentLength(2, arguments);
+		if (typeof block !== "function" || !(atomsAndValues instanceof RuntimeMap)) {
+			throw argumentError();
+		}
+		let callNamespace = block.namespace;
+		for (let atomAndValue of atomsAndValues) {
+			let atom = atomAndValue.at(0n);
+			if (!(atom instanceof RuntimeAtom)) {
+				throw argumentError();
+			}
+			callNamespace = callNamespace.mustInsert(atom.value, atomAndValue.at(1n));
+		}
+		return block.original.bind(callNamespace)(ns);
+	}],
+	["withArgs", function(_, argsAtom, block) {
+		checkArgumentLength(2, arguments);
+		if (!(argsAtom instanceof RuntimeAtom && typeof block == "function")) {
+			throw argumentError();
+		}
+		let fn: RuntimeBlockFunction = (ns, ...args) => {
+			return block.original.bind(
+				block.namespace.mustInsert(
+					argsAtom.value,
+					new RuntimeList(...args as RuntimeValue[])
+				),
+			)(ns);
+		}
+		return [null, createNewBlock(new EmptyNamespace<RuntimeValue>(), fn)];
+	}],
 	["println", function(_, ...args) {
-		println(args.map(v => runtimeTypeString(v!)).join(" "));
+		println(args.map(v => runtimeValueString(v!)).join(" "));
 		return [null, null];
 	}],
 ];
 
+function createNewBlock(ns: Namespace<RuntimeValue>, block: RuntimeBlockFunction): RuntimeBlock {
+	return Object.assign(block.bind(ns), { namespace: ns, original: block });
+}
+
 const builtinNamespace = builtinBlocks.reduce(
-	(ns: Namespace<RuntimeType>, [str, block]) => {
-		return ns.mustInsert(str, block);
+	(ns: Namespace<RuntimeValue>, [str, block]) => {
+		return ns.mustInsert(str, createNewBlock(new EmptyNamespace<RuntimeValue>(), block));
 	},
-	new EmptyNamespace<RuntimeType>(),
+	new EmptyNamespace<RuntimeValue>(),
 );
 
 const internals: { [name: string]: Function } = {
 	[newAtom]: (value: string): RuntimeAtom => {
 		return new RuntimeAtom(value);
 	},
-	[newList]: (...elements: RuntimeType[]): RuntimeList => {
+	[newList]: (...elements: RuntimeValue[]): RuntimeList => {
 		return new RuntimeList(...elements);
 	},
-	[newBlock]: (ns: Namespace<RuntimeType>, block: RuntimeBlock): RuntimeBlock => {
-		return block.bind(ns);
-	},
+	[newBlock]: createNewBlock,
+	[namespaceInsertMap]: (ns:  Namespace<RuntimeValue>, insertable: RuntimeMap): Namespace<RuntimeValue> => {
+		for (let kv of insertable) {
+			let key = kv.at(0n);
+			if (!(key instanceof RuntimeAtom)) {
+				throw new Error(`namespace insert: expected atom, got ${runtimeValueString(key)}`)
+			}
+			let value = kv.at(1n);
+			ns = ns.mustInsert(key.value, value);
+		}
+		return ns;
+	}
 };
 
 function stringAll(str: string, predicate: (char: string) => boolean): boolean {
@@ -1222,7 +1503,7 @@ function runExpressions(exprs: Expression[]): void {
 	for (let [name, varName] of builtinNamespaceVarNames) {
 		code += `const ${varName} = ${ourNamespace}.mustGet(${toJavascriptString(name)});\n`;
 	}
-	code += `\n${unpackAndMaybeAddToOursFn}\n\n`;
+	code += `\n${unpackAndMaybeAddToOursDefinition}\n\n`;
 
 	code += new Compiler(builtinNamespaceVarNames, exprs).compile();
 	console.log(code);

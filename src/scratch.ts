@@ -1,6 +1,10 @@
 function internal(): Error {
     return new Error("internal error");
-};
+}
+
+function unreachable(): never {
+	throw new Error("unreachable");
+}
 
 function positionError(pos: Position, message: string): Error {
 	return new Error(`${pos.path}|${pos.line} col ${pos.column}| ${message}`);
@@ -802,16 +806,69 @@ function expressionString(expr: Expression): string {
 }
 
 class Namespace<T> implements Iterable<[string, T]>{
+	entry: NamespaceEntry<T> | null;
+
+	constructor(entry: NamespaceEntry<T> | null = null) {
+		this.entry = entry;
+	}
+
+	toString(): string {
+		if (!this.entry) {
+			return "";
+		} else {
+			return this.entry.toString();
+		}
+	}
+
+	get(key: string): T | undefined {
+		try {
+			return this.mustGet(key);
+		} catch {
+			return undefined;
+		}
+	}
+
+	mustGet(key: string): T {
+		if (!this.entry) {
+			throw new Error(`key ${key} not found`);
+		}
+		return this.entry.mustGet(key);
+	}
+
+	insert(key: string, value: T): Namespace<T> | undefined {
+		try {
+			return this.mustInsert(key, value);
+		} catch {
+			return undefined;
+		}
+	}
+
+	mustInsert(key: string, value: T): Namespace<T> {
+		if (!this.entry) {
+			return new Namespace(new NamespaceEntry(key, value, null, null));
+		}
+		return new Namespace(this.entry.mustInsert(key, value));
+	}
+
+	*[Symbol.iterator](): Iterator<[string, T]> {
+		if (!this.entry) {
+			return;
+		}
+		yield* this.entry;
+	}
+}
+
+class NamespaceEntry<T> implements Iterable<[string, T]>{
 	key: string;
 	value: T;
-	left: Namespace<T> | null = null;
-	right: Namespace<T> | null = null;
+	left: NamespaceEntry<T> | null = null;
+	right: NamespaceEntry<T> | null = null;
 
 	constructor(
 		key: string,
 		value: T,
-		left: Namespace<T> | null,
-		right: Namespace<T> | null
+		left: NamespaceEntry<T> | null,
+		right: NamespaceEntry<T> | null
 	) {
 		this.key = key;
 		this.value = value;
@@ -831,16 +888,8 @@ class Namespace<T> implements Iterable<[string, T]>{
 		return str;
 	}
 
-	get(key: string): T | undefined {
-		try {
-			return this.mustGet(key);
-		} catch {
-			return undefined;
-		}
-	}
-
 	mustGet(key: string): T {
-		let current: Namespace<T> = this;
+		let current: NamespaceEntry<T> = this;
 		while (true) {
 			if (key < current.key) {
 				if (!current.left) {
@@ -858,25 +907,17 @@ class Namespace<T> implements Iterable<[string, T]>{
 		}
 	}
 
-	insert(key: string, value: T): Namespace<T> | undefined {
-		try {
-			return this.mustInsert(key, value);
-		} catch {
-			return undefined;
-		}
-	}
-
-	mustInsert(key: string, value: T): Namespace<T> {
+	mustInsert(key: string, value: T): NamespaceEntry<T> {
 		if (key < this.key) {
 			if (!this.left) {
-				return new Namespace(
+				return new NamespaceEntry(
 					this.key,
 					this.value,
-					new Namespace(key, value, null, null),
+					new NamespaceEntry(key, value, null, null),
 					this.right,
 				);
 			}
-			return new Namespace(
+			return new NamespaceEntry(
 				this.key,
 				this.value,
 				this.left.mustInsert(key, value),
@@ -884,14 +925,14 @@ class Namespace<T> implements Iterable<[string, T]>{
 			);
 		} else if (key > this.key) {
 			if (!this.right) {
-				return new Namespace(
+				return new NamespaceEntry(
 					this.key,
 					this.value,
 					this.left,
-					new Namespace(key, value, null, null),
+					new NamespaceEntry(key, value, null, null),
 				);
 			}
-			return new Namespace(
+			return new NamespaceEntry(
 				this.key,
 				this.value,
 				this.left,
@@ -911,25 +952,6 @@ class Namespace<T> implements Iterable<[string, T]>{
 			yield* this.right;
 		}
 	}
-}
-
-class EmptyNamespace<T> implements Iterable<[string, T]> {
-	// dummy values to make the typechecker happy
-	key: string = undefined as any as string;
-	value: T = undefined as any as T;
-	left: Namespace<T> | null = undefined as any as null;
-	right: Namespace<T> | null = undefined as any as null;
-
-	toString(): string { return ""; }
-	get(_key: string): T | undefined { return undefined; }
-	mustGet(key: string): T { throw `key ${key} not found`; }
-	insert(key: string, value: T): Namespace<T> | undefined {
-		return new Namespace(key, value, null, null);
-	}
-	mustInsert(key: string, value: T): Namespace<T> {
-		return new Namespace(key, value, null, null);
-	}
-	*[Symbol.iterator](): Iterator<[string, T]> {}
 }
 
 const ourNamespace = "ourNamespace";
@@ -1031,7 +1053,7 @@ class Compiler {
 		case "block":
 			let content = new Compiler(this.varNames, expr.expressions).compile();
 			return `(${newBlock}(${ourNamespace}, function(${theirNamespace}, ...args) {\n`
-				+ "if (!(args.length === 0 || (args.length === 1 && args[0] === null))) {\n"
+				+ "if (args.length !== 0) {\n"
 				+ "\tthrow new Error('cannot call basic block with arguments');\n"
 				+ "}\n"
 				+ `let ${ourNamespace} = this;\n`
@@ -1041,17 +1063,18 @@ class Compiler {
 	}
 }
 
-type Value = null | boolean | bigint | string | RuntimeBlock | RuntimeAtom | RuntimeList | RuntimeMap;
-
-type RuntimeBlock = {
-	namespace: Namespace<Value>;
-	original: RuntimeBlockFunction;
-	(ns: Namespace<Value>, ...args: (Value | undefined)[]):
-		ReturnType<RuntimeBlockFunction>;
-};
-
-type RuntimeBlockFunction = (ns: Namespace<Value>, ...args: (Value | undefined)[])
-	=> [RuntimeMap | null, Value];
+type Value = 
+	| null
+	| boolean
+	| bigint
+	| string
+	| Return
+	| Mut
+	| Unique
+	| RuntimeBlock
+	| RuntimeAtom
+	| RuntimeList
+	| RuntimeMap;
 
 function valueString(v: Value): string {
 	if (v === null) {
@@ -1077,6 +1100,67 @@ function valueEquals(v1: Value, v2: Value): boolean {
 	}
 }
 
+class Return {
+	value: Value;
+
+	constructor(value: Value) {
+		this.value = value;
+	}
+
+	equals(other: Value): boolean {
+		if (!(other instanceof Return)) {
+			return false;
+		}
+		return valueEquals(this.value, other.value);
+	}
+
+	toString(): string {
+		return `(return ${valueString(this.value)})`;
+	}
+}
+
+class Mut {
+	value: Value;
+
+	constructor(value: Value) {
+		this.value = value;
+	}
+
+	equals(other: Value): boolean {
+		if (!(other instanceof Mut)) {
+			return false;
+		}
+		return valueEquals(this.value, other.value);
+	}
+
+	toString(): string {
+		return `(mut ${valueString(this.value)})`;
+	}
+}
+
+class Unique {
+	equals(other: Value): boolean {
+		if (!(other instanceof Unique)) {
+			return false;
+		}
+		return this === other;
+	}
+
+	toString(): string {
+		return "unique";
+	}
+}
+
+type RuntimeBlock = {
+	namespace: Namespace<Value>;
+	original: RuntimeBlockFunction;
+	(ns: Namespace<Value>, ...args: (Value | undefined)[]):
+		ReturnType<RuntimeBlockFunction>;
+};
+
+type RuntimeBlockFunction = (ns: Namespace<Value>, ...args: (Value | undefined)[])
+	=> [RuntimeMap | null, Value];
+
 class RuntimeAtom {
 	value: string;
 
@@ -1092,7 +1176,7 @@ class RuntimeAtom {
 	}
 
 	toString(): string {
-		return `(atom ${toJavascriptString(this.value)})`;
+		return `(atom ${valueString(this.value)})`;
 	}
 }
 
@@ -1131,6 +1215,12 @@ class RuntimeList implements Iterable<Value> {
 		}
 		return this.elements[Number(idx)]!;
 	}
+
+	append(value: Value): RuntimeList {
+		let next = this.elements.slice();
+		next.push(value);
+		return new RuntimeList(...next);
+	} 
 
 	toString(): string {
 		return "[" + this.elements.map(e => valueString(e)).join(" ") + "]";
@@ -1268,9 +1358,9 @@ function match(matcher: Value, value: Value): boolean | RuntimeMap {
 	) {
 		return matcher === value;
 	} else if (matcher instanceof RuntimeAtom) {
-		return RuntimeMap.fromRuntimeValues(new EmptyNamespace<Value>(), new RuntimeList(matcher, value));
+		return RuntimeMap.fromRuntimeValues(new Namespace(), new RuntimeList(matcher, value));
 	} else if (typeof matcher === "function") {
-		let result = matcher(new EmptyNamespace<Value>(), value)[1];
+		let result = matcher(new Namespace(), value)[1];
 		if (typeof result === "boolean" || result instanceof RuntimeMap) {
 			return result;
 		} else {
@@ -1280,7 +1370,7 @@ function match(matcher: Value, value: Value): boolean | RuntimeMap {
 		if (!(value instanceof RuntimeList) || matcher.len() != value.len()) {
 			return false;
 		}
-		let results = RuntimeMap.fromRuntimeValues(new EmptyNamespace<Value>());
+		let results = RuntimeMap.fromRuntimeValues(new Namespace());
 		for (let i = 0n; i < matcher.len(); i++) {
 			let result = match(matcher.at(i), value.at(i));
 			if (!result) {
@@ -1295,7 +1385,7 @@ function match(matcher: Value, value: Value): boolean | RuntimeMap {
 		if (!(value instanceof RuntimeMap)) {
 			return false;
 		}
-		let results = RuntimeMap.fromRuntimeValues(new EmptyNamespace<Value>());
+		let results = RuntimeMap.fromRuntimeValues(new Namespace());
 		for (let kv of matcher) {
 			let found = value.tryGet(kv.at(0n));
 			if (found === undefined) {
@@ -1310,10 +1400,23 @@ function match(matcher: Value, value: Value): boolean | RuntimeMap {
 			}
 		}
 		return results;
+	} else if (matcher instanceof Mut) {
+		if (!(value instanceof Mut)) {
+			return false;
+		}
+		return match(matcher.value, value.value);
+	} else if (matcher instanceof Return) {
+		if (!(value instanceof Return)) {
+			return false;
+		}
+		return match(matcher.value, value.value);
+	} else if (matcher instanceof Unique) {
+		return matcher.equals(value);
 	} else {
-		throw internal();
+		unreachable();
 	}
 }
+
 
 function println(s: string) {
 	console.log(s);
@@ -1341,7 +1444,66 @@ function doNamespaceInsertMap(namespace: Namespace<Value>, map: RuntimeMap): Nam
 	return namespace;
 }
 
+function defBlock(_: Namespace<Value>, matcher: Value|undefined, block: Value|undefined): [RuntimeMap|null, Value] {
+	checkArgumentLength(2, arguments);
+	if (typeof block !== "function") {
+		throw argumentError();
+	}
+	let fn: RuntimeBlockFunction = (ns, ...args) => {
+		let matchee = new RuntimeList(...args as Value[]);
+		let result = match(matcher!, matchee);
+		if (!result) {
+			throw new Error("call with wrong arguments");
+		}
+		let callNamespace = block.namespace;
+		if (result instanceof RuntimeMap) {
+			callNamespace = doNamespaceInsertMap(callNamespace, result);
+		}
+		return block.original.call(callNamespace, ns);
+	};
+	return [null, createNewBlock(block.namespace, fn)];
+}
+
 const builtinBlocks: [string, RuntimeBlockFunction][] = [
+	["call", function(ns, block, args) {
+		if (arguments.length < 2 || arguments.length > 3) {
+			throw argumentError();
+		}
+		if (typeof block !== "function") {
+			throw argumentError();
+		}
+		if (arguments.length === 3) {
+			if (!(args instanceof RuntimeList)) {
+				throw argumentError();
+			}
+			return block(ns, ...args.elements)
+		} else {
+			return block(ns);
+		}
+	}],
+	["insertCall", function(ns, block, atomsAndValues) {
+		checkArgumentLength(2, arguments);
+		if (typeof block !== "function" || !(atomsAndValues instanceof RuntimeMap)) {
+			throw argumentError();
+		}
+		let callNamespace = doNamespaceInsertMap(block.namespace, atomsAndValues);
+		return block.original.bind(callNamespace)(ns);
+	}],
+	["withArgs", function(_, argsAtom, block) {
+		checkArgumentLength(2, arguments);
+		if (!(argsAtom instanceof RuntimeAtom && typeof block === "function")) {
+			throw argumentError();
+		}
+		let fn: RuntimeBlockFunction = (ns, ...args) => {
+			return block.original.bind(
+				block.namespace.mustInsert(
+					argsAtom.value,
+					new RuntimeList(...args as Value[])
+				),
+			)(ns);
+		};
+		return [null, createNewBlock(new Namespace(), fn)];
+	}],
 	["=", function(_, assignee, value) {
 		checkArgumentLength(2, arguments);
 		let result = match(assignee!, value!);
@@ -1354,25 +1516,8 @@ const builtinBlocks: [string, RuntimeBlockFunction][] = [
 			return [null, null];
 		}
 	}],
-	["def", function(_, matcher, block) {
-		checkArgumentLength(2, arguments);
-		if (typeof block !== "function") {
-			throw argumentError();
-		}
-		let fn: RuntimeBlockFunction = (ns, ...args) => {
-			let matchee = new RuntimeList(...args as Value[]);
-			let result = match(matcher!, matchee);
-			if (!result) {
-				throw new Error("call with wrong arguments");
-			}
-			let callNamespace = block.namespace;
-			if (result instanceof RuntimeMap) {
-				callNamespace = doNamespaceInsertMap(callNamespace, result);
-			}
-			return block.original.call(callNamespace, ns);
-		};
-		return [null, createNewBlock(block.namespace, fn)];
-	}],
+	["def", defBlock],
+	["->", defBlock],
 	["match", function(ns, value, matchersAndBlocks) {
 		checkArgumentLength(2, arguments);
 		if (!(matchersAndBlocks instanceof RuntimeList)
@@ -1398,38 +1543,196 @@ const builtinBlocks: [string, RuntimeBlockFunction][] = [
 		}
 		throw new Error("match: no pattern matched");
 	}],
+	["return", function(_, value) {
+		checkArgumentLength(1, arguments);
+		throw new Return(value!);
+	}],
+	["returnv", function(_, value) {
+		checkArgumentLength(1, arguments);
+		return [null, new Return(value!)];
+	}],
+	["if", function(ns, cond, trueBlock, falseBlock) {
+		checkArgumentLength(3, arguments);
+		if (typeof trueBlock !== "function" || typeof falseBlock !== "function") {
+			throw argumentError();
+		}
+		if (cond === null || cond === false) {
+			return falseBlock(ns);
+		} else {
+			return trueBlock(ns);
+		}
+	}],
+	["or", function(ns, condsAndBlocks) {
+		checkArgumentLength(1, arguments);
+		if (!(condsAndBlocks instanceof RuntimeList)
+			|| condsAndBlocks.len() % 2n !== 0n)
+		{
+			throw argumentError();
+		}
+		for (let i = 0n; i < condsAndBlocks.len(); i += 2n) {
+			let cond = condsAndBlocks.at(i);
+			let block = condsAndBlocks.at(i+1n);
+			if (typeof block !== "function") {
+				throw argumentError();
+			}
+			if (typeof cond === "function") {
+				cond = cond(ns)[1];
+			}
+			if (cond === null || cond === false) {
+				continue;
+			}
+			return block(ns);
+		}
+		throw new Error("or: no truthy condition");
+	}],
+	["loop", function(ns, block) {
+		checkArgumentLength(1, arguments);
+		if (typeof block !== "function") {
+			throw argumentError();
+		}
+		while(true) {
+			try {
+				block(ns)
+			} catch (e) {
+				if (e instanceof Return) {
+					return [null, e.value];
+				} else {
+					throw e;
+				}
+			}
+		}
+	}],
+	["==", function(_, x, y) {
+		checkArgumentLength(2, arguments);
+		return [null, valueEquals(x!, y!)];
+	}],
+	["!=", function(_, x, y) {
+		checkArgumentLength(2, arguments);
+		return [null, !valueEquals(x!, y!)];
+	}],
+	["<", function(_, x, y) {
+		checkArgumentLength(2, arguments);
+		if (typeof x !== "bigint" || typeof y !== "bigint") {
+			throw argumentError();
+		}
+		return [null, x < y];
+	}],
+	["<=", function(_, x, y) {
+		checkArgumentLength(2, arguments);
+		if (typeof x !== "bigint" || typeof y !== "bigint") {
+			throw argumentError();
+		}
+		return [null, x <= y];
+	}],
+	[">", function(_, x, y) {
+		checkArgumentLength(2, arguments);
+		if (typeof x !== "bigint" || typeof y !== "bigint") {
+			throw argumentError();
+		}
+		return [null, x > y];
+	}],
+	[">=", function(_, x, y) {
+		checkArgumentLength(2, arguments);
+		if (typeof x !== "bigint" || typeof y !== "bigint") {
+			throw argumentError();
+		}
+		return [null, x >= y];
+	}],
 	["+", function(_, x, y) {
 		checkArgumentLength(2, arguments);
 		if (typeof x !== "bigint" || typeof y !== "bigint") {
 			throw argumentError();
 		}
-		return [null, x+y];
+		return [null, x + y];
+	}],
+	["-", function(_, x, y) {
+		checkArgumentLength(2, arguments);
+		if (typeof x !== "bigint" || typeof y !== "bigint") {
+			throw argumentError();
+		}
+		return [null, x - y];
+	}],
+	["*", function(_, x, y) {
+		checkArgumentLength(2, arguments);
+		if (typeof x !== "bigint" || typeof y !== "bigint") {
+			throw argumentError();
+		}
+		return [null, x * y];
+	}],
+	["//", function(_, x, y) {
+		checkArgumentLength(2, arguments);
+		if (typeof x !== "bigint" || typeof y !== "bigint") {
+			throw argumentError();
+		}
+		return [null, x / y];
+	}],
+	["%", function(_, x, y) {
+		checkArgumentLength(2, arguments);
+		if (typeof x !== "bigint" || typeof y !== "bigint") {
+			throw argumentError();
+		}
+		return [null, x % y];
 	}],
 	["map", function(ns, ...elements) {
 		return [null, RuntimeMap.fromRuntimeValues(ns, ...elements as Value[])];
 	}],
-	["insertCall", function(ns, block, atomsAndValues) {
+	[".", function(_, map, key) {
 		checkArgumentLength(2, arguments);
-		if (typeof block !== "function" || !(atomsAndValues instanceof RuntimeMap)) {
+		if (!(map instanceof RuntimeMap)) {
 			throw argumentError();
 		}
-		let callNamespace = doNamespaceInsertMap(block.namespace, atomsAndValues);
-		return block.original.bind(callNamespace)(ns);
+		return [null, map.get(key!)];
 	}],
-	["withArgs", function(_, argsAtom, block) {
+	["append", function(_, list, value) {
 		checkArgumentLength(2, arguments);
-		if (!(argsAtom instanceof RuntimeAtom && typeof block == "function")) {
+		if (!(list instanceof RuntimeList)) {
 			throw argumentError();
 		}
-		let fn: RuntimeBlockFunction = (ns, ...args) => {
-			return block.original.bind(
-				block.namespace.mustInsert(
-					argsAtom.value,
-					new RuntimeList(...args as Value[])
-				),
-			)(ns);
-		};
-		return [null, createNewBlock(new EmptyNamespace<Value>(), fn)];
+		return [null, list.append(value!)];
+	}],
+	["mut",  function(_, value) {
+		checkArgumentLength(1, arguments);
+		return [null, new Mut(value!)];
+	}],
+	["load",  function(_, mut) {
+		checkArgumentLength(1, arguments);
+		if (!(mut instanceof Mut)) {
+			throw argumentError();
+		}
+		return [null, mut.value];
+	}],
+	["<-", function(_, mut, value) {
+		checkArgumentLength(2, arguments);
+		if (!(mut instanceof Mut)) {
+			throw argumentError();
+		}
+		mut.value = value!;
+		return [null, null];
+	}],
+	["|>", function(ns, input, receiver) {
+		checkArgumentLength(2, arguments);
+		if (typeof receiver !== "function") {
+			throw argumentError();
+		}
+		return receiver(ns, input);
+	}],
+	["..", function(ns, start, end) {
+		checkArgumentLength(2, arguments);
+		if (typeof start !== "bigint" || typeof end !== "bigint") {
+			throw argumentError();
+		}
+		if (start >= end) {
+			throw new Error("range: start cannot be greater or equal");
+		}
+		return [null, RuntimeMap.fromRuntimeValues(
+			ns,
+			new RuntimeList(new RuntimeAtom("start"), start),
+			new RuntimeList(new RuntimeAtom("end"), end),
+		)];
+	}],
+	["unique",  function(_) {
+		checkArgumentLength(0, arguments);
+		return [null, new Unique()];
 	}],
 	["println", function(_, ...args) {
 		println(args.map(v => valueString(v!)).join(" "));
@@ -1449,10 +1752,10 @@ function createNewBlock(ns: Namespace<Value>, block: RuntimeBlockFunction): Runt
 
 const builtinNamespace = (() => {
 	let ns = builtinBlocks.reduce(
-		(ns: Namespace<Value>, [str, block]) => {
-			return ns.mustInsert(str, createNewBlock(new EmptyNamespace<Value>(), block));
+		(ns, [str, block]) => {
+			return ns.mustInsert(str, createNewBlock(new Namespace(), block));
 		},
-		new EmptyNamespace<Value>(),
+		new Namespace<Value>(),
 	);
 	return builtinOther.reduce((ns, [str, value]) => ns.mustInsert(str, value), ns);
 })();
@@ -1532,7 +1835,7 @@ function toJavascriptVarName(str: string): string {
 }
 
 const builtinNamespaceVarNames = (() => {
-	let ns: Namespace<string> = new EmptyNamespace<string>();
+	let ns = new Namespace<string>();
 	for (let [name, _] of builtinNamespace) {
 		ns = ns.mustInsert(name, toJavascriptVarName(name));
 	};
@@ -1557,9 +1860,7 @@ function runExpressions(exprs: Expression[]): void {
 	new Function(internalsName, ourNamespace, code)(internals, builtinNamespace);
 }
 
-function run() {
-	let code = (document.getElementById("code") as HTMLInputElement).value;
-
+function run(code: string) {
 	let tokens = [];
 	for (let tok of new Lexer("textarea", code)) {
 		if (tok.kind === "atom"
@@ -1589,7 +1890,7 @@ function run() {
 			["..", "..<", "<..", "<..<"],
 			["++"],
 			["+", "-"],
-			["*", "/", "//", "%%"],
+			["*", "/", "//", "%"],
 			["@"],
 			["."],
 		],

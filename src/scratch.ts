@@ -958,24 +958,28 @@ const ourNamespace = "ourNamespace";
 
 const theirNamespace = "theirNamespace";
 
-const namespaceInsertMap = "namespaceInsertMap";
+const internalNamespaceInsertMap = "namespaceInsertMap";
 
 const unpackAndMaybeAddToOurs = "unpackAndMaybeAddToOurs";
 
 const unpackAndMaybeAddToOursDefinition = `const ${unpackAndMaybeAddToOurs} = ([insertable, ret]) => {
 	if (insertable) {
-		${ourNamespace} = ${namespaceInsertMap}(${ourNamespace}, insertable);
+		${ourNamespace} = ${internalNamespaceInsertMap}(${ourNamespace}, insertable);
 	}
 	return ret;
 };`
 
-const newAtom = "newAtom";
+const internalNewAtom = "newAtom";
 
-const newList = "newList";
+const internalNewList = "newList";
 
-const newListFromArgs = "newListFromArgs";
+const internalNewBlock = "newBlock";
 
-const newBlock = "newBlock";
+const internalMatch = "match";
+
+const internalIsList = "isList";
+
+const internalIsMap = "isMap";
 
 function stringMap(str: string, predicate: (char: string) => string): string {
 	let out = "";
@@ -996,6 +1000,25 @@ function toJavascriptString(str: string): string {
 		}
 	});
 	return `"${esc}"`;
+}
+
+const symbolAssign = "=";
+
+const errorMessageAssignMatch = `${symbolAssign} pattern match failed`;
+
+const throwAssignMatch = `throw new Error(${toJavascriptString(errorMessageAssignMatch)});`
+
+function asAssignment(call: Call): {assignee: Expression, value: Expression} | null {
+	if (call.first.kind !== "ref"
+		|| call.first.value !== symbolAssign
+		|| call.arguments.length !== 2) {
+			return null;
+	}
+	return { assignee: call.arguments[0]!, value: call.arguments[1]! };
+}
+
+function newJavascriptNumber(n: number | bigint): string {
+	return `${n}n`;
 }
 
 class Compiler {
@@ -1023,7 +1046,12 @@ class Compiler {
 			if (expr.kind !== "call") {
 				continue;
 			}
-			this.code += this.expr(expr) + ";";
+			let assign = asAssignment(expr);
+			if (!assign) {
+				this.code += this.expr(expr) + ";";
+			} else {
+				this.assignment(assign.assignee, this.expr(assign.value));
+			}
 		}
 		let last = this.expr(this.body[this.body.length-1]!);
 		this.code += `return [null, ${last}];`
@@ -1035,11 +1063,11 @@ class Compiler {
 		case "unit":
 			return "null";
 		case "number":
-			return `${expr.value}n`;
+			return newJavascriptNumber(expr.value);
 		case "string":
 			return `${toJavascriptString(expr.value)}`
 		case "atom":
-			return `(${newAtom}(${toJavascriptString(expr.value)}))`;
+			return `(${internalNewAtom}(${toJavascriptString(expr.value)}))`;
 		case "ref":
 			return this.varNames.get(expr.value)
 				?? `(${ourNamespace}.mustGet(${toJavascriptString(expr.value)}))`;
@@ -1049,10 +1077,10 @@ class Compiler {
 			return `(${unpackAndMaybeAddToOurs}(${first}(${ourNamespace}, ${args})))`;
 		case "list":
 			let elements = expr.elements.map(e => this.expr(e)).join(", ");
-			return `(${newList}(${elements}))`;
+			return `(${internalNewList}(${elements}))`;
 		case "block":
 			let content = new Compiler(this.varNames, expr.expressions).compile();
-			return `(${newBlock}(${ourNamespace}, function(${theirNamespace}, ...args) {\n`
+			return `(${internalNewBlock}(${ourNamespace}, function(${theirNamespace}, ...args) {\n`
 				+ "if (args.length !== 0) {\n"
 				+ "\tthrow new Error('cannot call basic block with arguments');\n"
 				+ "}\n"
@@ -1060,6 +1088,59 @@ class Compiler {
 				+ unpackAndMaybeAddToOursDefinition + '\n\n'
 				+ content + "\n}))";
 		}
+	}
+
+	assignment(assignee: Expression, value: string): void {
+		if (assignee.kind === "unit"
+			|| assignee.kind === "number"
+			|| assignee.kind === "string"
+		) {
+			this.code += `if (${this.expr(assignee)} !== ${value}) {\n`
+				+ `\t${throwAssignMatch}\n`
+				+ "}\n";
+		} else if (assignee.kind === "atom") {
+			let varName = toJavascriptVarName(assignee.value);
+			let next = this.varNames.insert(assignee.value, varName);
+			let temp = this.addTemporaryWith(value);
+			if (next !== undefined) {
+				this.varNames = next;
+				this.code += `const ${varName} = ${temp};\n`
+			}
+			this.code += `${ourNamespace} = ${ourNamespace}.mustInsert(`
+				+ `${toJavascriptString(assignee.value)}, ${temp});\n`
+		} else if (assignee.kind === "list") {
+			let temp = this.addTemporaryWith(value);
+			let expectedLength = newJavascriptNumber(assignee.elements.length);
+			this.code += `if (!${internalIsList}(${temp}) || ${temp}.len() !== ${expectedLength}) {\n`
+				+ `\t${throwAssignMatch}\n`
+				+ "}\n";
+			for (let i = 0; i < assignee.elements.length; i++) {
+				let element = assignee.elements[i]!;
+				this.assignment(element, `${temp}.at(${newJavascriptNumber(i)})`);
+			}
+		} else {
+			let temp = this.newTemporary();
+			this.code += `const ${temp} = `
+				+ `${internalMatch}(${this.expr(assignee)}, ${value});\n`;
+				+ `if (!${temp}) {\n`
+				+ `\t${throwAssignMatch}\n`
+				+ "}\n"
+				+ `if (${internalIsMap}(${temp})) {\n`
+				+ `\t${ourNamespace} = ${internalNamespaceInsertMap}(${ourNamespace}, ${temp});\n`
+				+ "}\n";
+		}
+	}
+
+	newTemporary(): string {
+		let name = `_${this.temporariesIndex}`
+		this.temporariesIndex++;
+		return name;
+	}
+
+	addTemporaryWith(expr: string): string {
+		let name = this.newTemporary();
+		this.code += `const ${name} = ${expr};\n`;
+		return name;
 	}
 }
 
@@ -1444,7 +1525,7 @@ function doNamespaceInsertMap(namespace: Namespace<Value>, map: RuntimeMap): Nam
 	return namespace;
 }
 
-function defBlock(_: Namespace<Value>, matcher: Value|undefined, block: Value|undefined): [RuntimeMap|null, Value] {
+function defineBlock(_: Namespace<Value>, matcher: Value|undefined, block: Value|undefined): [RuntimeMap|null, Value] {
 	checkArgumentLength(2, arguments);
 	if (typeof block !== "function") {
 		throw argumentError();
@@ -1463,6 +1544,8 @@ function defBlock(_: Namespace<Value>, matcher: Value|undefined, block: Value|un
 	};
 	return [null, createNewBlock(block.namespace, fn)];
 }
+
+const stopValue = new Unique();
 
 const builtinBlocks: [string, RuntimeBlockFunction][] = [
 	["call", function(ns, block, args) {
@@ -1504,11 +1587,11 @@ const builtinBlocks: [string, RuntimeBlockFunction][] = [
 		};
 		return [null, createNewBlock(new Namespace(), fn)];
 	}],
-	["=", function(_, assignee, value) {
+	[symbolAssign, function(_, assignee, value) {
 		checkArgumentLength(2, arguments);
 		let result = match(assignee!, value!);
 		if (!result) {
-			throw new Error("= pattern match failed");
+			throw new Error(errorMessageAssignMatch);
 		}
 		if (result instanceof RuntimeMap) {
 			return [result, null];
@@ -1516,8 +1599,8 @@ const builtinBlocks: [string, RuntimeBlockFunction][] = [
 			return [null, null];
 		}
 	}],
-	["def", defBlock],
-	["->", defBlock],
+	["def", defineBlock],
+	["->", defineBlock],
 	["match", function(ns, value, matchersAndBlocks) {
 		checkArgumentLength(2, arguments);
 		if (!(matchersAndBlocks instanceof RuntimeList)
@@ -1676,19 +1759,38 @@ const builtinBlocks: [string, RuntimeBlockFunction][] = [
 	["map", function(ns, ...elements) {
 		return [null, RuntimeMap.fromRuntimeValues(ns, ...elements as Value[])];
 	}],
-	[".", function(_, map, key) {
-		checkArgumentLength(2, arguments);
-		if (!(map instanceof RuntimeMap)) {
-			throw argumentError();
-		}
-		return [null, map.get(key!)];
-	}],
 	["append", function(_, list, value) {
 		checkArgumentLength(2, arguments);
 		if (!(list instanceof RuntimeList)) {
 			throw argumentError();
 		}
 		return [null, list.append(value!)];
+	}],
+	["toList", function(ns, iterator) {
+		checkArgumentLength(1, arguments);
+		if (typeof iterator !== "function") {
+			throw argumentError();
+		}
+		let next = iterator(ns)[1];
+		if (typeof next !== "function") {
+			throw argumentError();
+		}
+		let elements = [];
+		while (true) {
+			let element = next(ns)[1];
+			if (element === stopValue) {
+				return [null, new RuntimeList(...elements)];
+			}
+			elements.push(element);
+		}
+
+	}],
+	[".", function(_, map, key) {
+		checkArgumentLength(2, arguments);
+		if (!(map instanceof RuntimeMap)) {
+			throw argumentError();
+		}
+		return [null, map.get(key!)];
 	}],
 	["mut",  function(_, value) {
 		checkArgumentLength(1, arguments);
@@ -1744,6 +1846,7 @@ const builtinOther: [string, Value][] = [
 	["null", null],
 	["false", false],
 	["true", true],
+	["stop", stopValue]
 ];
 
 function createNewBlock(ns: Namespace<Value>, block: RuntimeBlockFunction): RuntimeBlock {
@@ -1761,14 +1864,21 @@ const builtinNamespace = (() => {
 })();
 
 const internals: { [name: string]: Function } = {
-	[newAtom]: (value: string): RuntimeAtom => {
+	[internalNewAtom]: (value: string): RuntimeAtom => {
 		return new RuntimeAtom(value);
 	},
-	[newList]: (...elements: Value[]): RuntimeList => {
+	[internalNewList]: (...elements: Value[]): RuntimeList => {
 		return new RuntimeList(...elements);
 	},
-	[newBlock]: createNewBlock,
-	[namespaceInsertMap]: doNamespaceInsertMap,
+	[internalNewBlock]: createNewBlock,
+	[internalNamespaceInsertMap]: doNamespaceInsertMap,
+	[internalMatch]: match,
+	[internalIsList]: (maybeList: unknown): boolean => {
+		return maybeList instanceof RuntimeList;
+	},
+	[internalIsMap]: (maybeMap: unknown): boolean => {
+		return maybeMap instanceof RuntimeMap;
+	},
 };
 
 function stringAll(str: string, predicate: (char: string) => boolean): boolean {
@@ -1879,7 +1989,7 @@ function run(code: string) {
 	let parser = new Parser(
 		new Lexer("textarea", code),
 		[
-			["=", "<-"],
+			[symbolAssign, "<-"],
 			["|>"],
 		],
 		[
@@ -1901,4 +2011,4 @@ function run(code: string) {
 	}
 
 	runExpressions(exprs);
-};
+}

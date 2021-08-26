@@ -954,9 +954,9 @@ class NamespaceEntry<T> implements Iterable<[string, T]>{
 	}
 }
 
-const ourNamespace = "ourNamespace";
+const nameOurNamespace = "ourNamespace";
 
-const theirNamespace = "theirNamespace";
+const nameTheirNamespace = "theirNamespace";
 
 const internalNamespaceInsertMap = "namespaceInsertMap";
 
@@ -964,7 +964,7 @@ const unpackAndMaybeAddToOurs = "unpackAndMaybeAddToOurs";
 
 const unpackAndMaybeAddToOursDefinition = `const ${unpackAndMaybeAddToOurs} = ([insertable, ret]) => {
 	if (insertable) {
-		${ourNamespace} = ${internalNamespaceInsertMap}(${ourNamespace}, insertable);
+		${nameOurNamespace} = ${internalNamespaceInsertMap}(${nameOurNamespace}, insertable);
 	}
 	return ret;
 };`
@@ -993,7 +993,18 @@ function stringMap(str: string, predicate: (char: string) => string): string {
 
 function toJavascriptString(str: string): string {
 	let esc = stringMap(str, char => {
-		if (char === "\\") {
+		if (!/^[\u0020-\u007E]$/.test(char)) {
+			let esc = "";
+			for (let i = 0; i < char.length; i++) {
+				let codePoint = char.charCodeAt(i);
+				let hex = codePoint.toString(16);
+				while (hex.length < 4) {
+					hex = '0' + hex;
+				}
+				esc += `\\u${hex}`;
+			}
+			return esc;
+		} else if (char === "\\") {
 			return "\\\\";
 		} else if (char === '"') {
 			return '\\"';
@@ -1096,13 +1107,13 @@ class Compiler {
 			return `(${internalNewAtom}(${toJavascriptString(expr.value)}))`;
 		case "ref":
 			return this.varNames.get(expr.value)
-				?? `(${ourNamespace}.mustGet(${toJavascriptString(expr.value)}))`;
+				?? `(${nameOurNamespace}.mustGet(${toJavascriptString(expr.value)}))`;
 		case "call":
 			let define = asDefine(expr);
 			if (!define) {
 				let first = this.expr(expr.first);
 				let args = expr.arguments.map(arg => this.expr(arg)).join(", ");
-				return `(${unpackAndMaybeAddToOurs}(${first}(${ourNamespace}, ${args})))`;
+				return `(${unpackAndMaybeAddToOurs}(${first}(${nameOurNamespace}, ${args})))`;
 			} else {
 				return this.define(define.args, define.block);
 			}
@@ -1111,11 +1122,11 @@ class Compiler {
 			return `(${internalNewList}(${elements}))`;
 		case "block":
 			let content = new Compiler(this.varNames, expr.expressions).compile();
-			return `(${internalNewBlock}(${ourNamespace}, function(${theirNamespace}, ...args) {\n`
+			return `(${internalNewBlock}(${nameOurNamespace}, function(${nameTheirNamespace}, ...args) {\n`
 				+ "if (args.length !== 0) {\n"
 				+ "\tthrow new Error('cannot call basic block with arguments');\n"
 				+ "}\n"
-				+ `let ${ourNamespace} = this;\n`
+				+ `let ${nameOurNamespace} = this;\n`
 				+ unpackAndMaybeAddToOursDefinition + '\n\n'
 				+ content + "\n}))";
 		}
@@ -1134,18 +1145,18 @@ class Compiler {
 				next = maybeNext;
 				variableHeader += `const ${varName} = ${temp};\n`;
 			}
-			variableHeader += `${ourNamespace} = ${ourNamespace}.mustInsert(`
+			variableHeader += `${nameOurNamespace} = ${nameOurNamespace}.mustInsert(`
 				+ `${toJavascriptString(arg.value)}, ${temp});\n`;
 			jsArgs += `, ${temp}`;
 		}
 
 		let content = new Compiler(this.varNames, block.expressions, args.length).compile();
-		return `(${internalNewBlock}(${ourNamespace}, function(${theirNamespace}${jsArgs}) {\n`
+		return `(${internalNewBlock}(${nameOurNamespace}, function(${nameTheirNamespace}${jsArgs}) {\n`
 			+ `if (arguments.length-1 !== ${args.length}) {\n`
 			// TODO: throw MatchError
 			+ `\tthrow new Error(\`expected ${args.length} argument(s), got \${arguments.length-1}\`);\n`
 			+ "}\n"
-			+`let ${ourNamespace} = this;\n`
+			+`let ${nameOurNamespace} = this;\n`
 			+ unpackAndMaybeAddToOursDefinition + '\n'
 			+ variableHeader + '\n\n'
 			+ content + "\n}))";
@@ -1166,7 +1177,7 @@ class Compiler {
 				this.varNames = next;
 				this.code += `const ${varName} = ${tempValue};\n`;
 			}
-			this.code += `${ourNamespace} = ${ourNamespace}.mustInsert(`
+			this.code += `${nameOurNamespace} = ${nameOurNamespace}.mustInsert(`
 				+ `${toJavascriptString(assignee.value)}, ${tempValue});\n`;
 		} else if (assignee.kind === "list") {
 			let expectedLength = newJavascriptNumber(assignee.elements.length);
@@ -1195,7 +1206,7 @@ class Compiler {
 			this.code += `const ${temp} = `
 				+ `${internalMatch}(${tempAssignee}, ${tempValue});\n`
 				+ `if (${internalIsMap}(${temp})) {\n`
-				+ `\t${ourNamespace} = ${internalNamespaceInsertMap}(${ourNamespace}, ${temp});\n`
+				+ `\t${nameOurNamespace} = ${internalNamespaceInsertMap}(${nameOurNamespace}, ${temp});\n`
 				+ "}\n";
 		}
 	}
@@ -2053,7 +2064,7 @@ const builtinNamespaceVarNames = (() => {
 })();
 
 function runExpressions(exprs: Expression[]): void {
-	let code = "'use strict';\n\n";
+	let code = "(function() {\n'use strict';\n\n";
 	const internalsName = "internals";
 	for (let name of Object.keys(internals)) {
 		code += `const ${name} = ${internalsName}.${name};\n`;
@@ -2061,13 +2072,18 @@ function runExpressions(exprs: Expression[]): void {
 	code += "\n";
 
 	for (let [name, varName] of builtinNamespaceVarNames) {
-		code += `const ${varName} = ${ourNamespace}.mustGet(${toJavascriptString(name)});\n`;
+		code += `const ${varName} = ${nameOurNamespace}.mustGet(${toJavascriptString(name)});\n`;
 	}
 	code += `\n${unpackAndMaybeAddToOursDefinition}\n\n`;
 
 	code += new Compiler(builtinNamespaceVarNames, exprs).compile();
+	code += "\n})();";
+
 	console.log(code);
-	new Function(internalsName, ourNamespace, code)(internals, builtinNamespace);
+
+	let ourNamespace = builtinNamespace;
+	ourNamespace.entry // to disable ourNamespace never read error
+	eval(code);
 }
 
 function run(code: string) {

@@ -1015,6 +1015,30 @@ function asAssignment(call: Call): {assignee: Expression, value: Expression} | n
 	return { assignee: call.arguments[0]!, value: call.arguments[1]! };
 }
 
+const symbolDefine = "->";
+
+const identDefine = "def";
+
+function asDefine(call: Call): {args: Atom[], block: Block} | null {
+	if (call.first.kind !== "ref"
+		|| (call.first.value !== symbolDefine && call.first.value !== identDefine)
+		|| call.arguments.length !== 2) {
+			return null;
+	}
+	let args = call.arguments[0]!;
+	if (args.kind !== "list") {
+		return null;
+	}
+	if (!args.elements.every(e => e.kind === "atom")) {
+		return null;
+	};
+	let block = call.arguments[1]!;
+	if (block.kind !== "block") {
+		return null;
+	}
+	return { args: args.elements as Atom[], block }
+}
+
 function newJavascriptNumber(n: number | bigint): string {
 	return `${n}n`;
 }
@@ -1074,9 +1098,14 @@ class Compiler {
 			return this.varNames.get(expr.value)
 				?? `(${ourNamespace}.mustGet(${toJavascriptString(expr.value)}))`;
 		case "call":
-			let first = this.expr(expr.first);
-			let args = expr.arguments.map(arg => this.expr(arg)).join(", ");
-			return `(${unpackAndMaybeAddToOurs}(${first}(${ourNamespace}, ${args})))`;
+			let define = asDefine(expr);
+			if (!define) {
+				let first = this.expr(expr.first);
+				let args = expr.arguments.map(arg => this.expr(arg)).join(", ");
+				return `(${unpackAndMaybeAddToOurs}(${first}(${ourNamespace}, ${args})))`;
+			} else {
+				return this.define(define.args, define.block);
+			}
 		case "list":
 			let elements = expr.elements.map(e => this.expr(e)).join(", ");
 			return `(${internalNewList}(${elements}))`;
@@ -1090,6 +1119,36 @@ class Compiler {
 				+ unpackAndMaybeAddToOursDefinition + '\n\n'
 				+ content + "\n}))";
 		}
+	}
+
+	define(args: Atom[], block: Block): string {
+		let next = this.varNames;
+		let variableHeader = "";
+		let jsArgs = "";
+		for (let i = 0; i < args.length; i++) {
+			let arg = args[i]!;
+			let temp = `_${i}`;
+			let varName = toJavascriptVarName(arg.value);
+			let maybeNext = next.insert(arg.value, varName);
+			if (maybeNext !== undefined) {
+				next = maybeNext;
+				variableHeader += `const ${varName} = ${temp};\n`;
+			}
+			variableHeader += `${ourNamespace} = ${ourNamespace}.mustInsert(`
+				+ `${toJavascriptString(arg.value)}, ${temp});\n`;
+			jsArgs += `, ${temp}`;
+		}
+
+		let content = new Compiler(this.varNames, block.expressions, args.length).compile();
+		return `(${internalNewBlock}(${ourNamespace}, function(${theirNamespace}${jsArgs}) {\n`
+			+ `if (arguments.length-1 !== ${args.length}) {\n`
+			// TODO: throw MatchError
+			+ `\tthrow new Error(\`expected ${args.length} argument(s), got \${arguments.length-1}\`);\n`
+			+ "}\n"
+			+`let ${ourNamespace} = this;\n`
+			+ unpackAndMaybeAddToOursDefinition + '\n'
+			+ variableHeader + '\n\n'
+			+ content + "\n}))";
 	}
 
 	assignment(assignee: Expression, tempAssignee: string, tempValue: string): void {
@@ -1631,8 +1690,8 @@ const builtinBlocks: [string, RuntimeBlockFunction][] = [
 			return [null, null];
 		}
 	}],
-	["def", defineBlock],
-	["->", defineBlock],
+	[identDefine, defineBlock],
+	[symbolDefine, defineBlock],
 	["match", function(ns, value, matchersAndBlocks) {
 		checkArgumentLength(2, arguments);
 		if (!(matchersAndBlocks instanceof RuntimeList)
@@ -2034,7 +2093,7 @@ function run(code: string) {
 			["|>"],
 		],
 		[
-			["->"],
+			[symbolDefine],
 			["&&", "||"],
 			["==", "!="],
 			["<", "<=", ">", ">="],
